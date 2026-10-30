@@ -1,0 +1,44 @@
+---
+title: "sleep_regression_draft"
+author: "Alexander Khramov"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Попробуем с выбросами
+
+```{r}
+sleep |> filter(NAME %in% outliers.log.NAME) |> datatable(options = list(scrollX=T))
+```
+
+```{r}
+model.full <- lm(LIFESPAN.log ~ . - NAME, sleep.reg, na.action=na.omit)
+model.full.beta <- model.full |> lm.beta()
+model.full.beta |> summary()
+```
+
+```{r}
+model.excl <- lm(LIFESPAN.log ~ . - NAME - GESTTIME.log, sleep.reg, na.action=na.omit)
+model.excl.beta <- model.excl |> lm.beta()
+model.excl.beta |> summary()
+```
+
+```{r}
+confidenceEllipse(model.full.beta, 
+                  which.coef = c("BRAIN_WEIGHT.log", "SLEEP"),
+                  levels = c(0.95),
+                  col = c("steelblue"),
+                  ylim=c(0,0.55),
+                  xlim=c(0,1.2))
+```
+
+```{r}
+model.tiny <- lm(LIFESPAN.log ~ BRAIN_WEIGHT.log, sleep.reg, na.action=na.omit)
+model.tiny.beta <- model.tiny |> lm.beta()
+model.tiny.beta |> summary()
+```
+

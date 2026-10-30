@@ -1,0 +1,507 @@
+---
+title: "Анализ зависимостей"
+author: "Александр Храмов"
+date: "13.10.2025"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, warning = T, message = T, fig.align = 'center', fig.width=8, fig.height=6, fig.dpi=300, dev="svg")
+```
+
+```{r load_data, include=FALSE}
+library(dplyr, tidyr)
+library(learningtower)
+library(ggplot2)
+library(GGally)
+library(glmnet)  # for ridge regression
+library(psych)   # for function tr() to compute trace of a matrix
+library(nortest)
+library(car)
+library(moments)
+library(MASS)
+library(corrplot)
+library(lm.beta)
+library(ellipse)
+library(conflicted)
+library(DT)
+library(patchwork)
+library(caret)
+library(readxl)
+library(FactoMineR)
+library(factoextra)
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+
+decorated_dt <- function(data, digits = 3) {
+  num_cols <- which(sapply(data, is.numeric))
+  names(num_cols) <- NULL
+  
+  datatable(data, 
+            options = list(
+              scrollX = TRUE,
+              columnDefs = 
+                list(list(targets = num_cols,  # JS uses 0-based indexing
+                     render = JS(sprintf(
+                       "function(data, type, row){ 
+                          if (data === null || isNaN(data)) { return 'NA'; }
+                          return data.toFixed(%d); 
+                        }", digits
+                     ))))
+              
+            ))
+}
+```
+
+# Введение
+
+В этом отчёте проводится разведочный анализ набора данных о
+характеристиках автомобилей. Цель — понять структуру данных,
+распределение признаков, выявить выбросы и неоднородности, а также
+проверить вид распределений (в частности, нормальность и
+логнормальность). Данные содержат информацию о различных моделях
+автомобилей, включая расход топлива, мощность, вес, страну происхождения
+и другие параметры.
+
+# Предварительный анализ данных
+
+## Загрузка и первичный осмотр
+
+```{r}
+cardata <- read_excel("CARDATA.xls") %>% 
+  mutate(ORIGIN = factor(ORIGIN, labels = c("USA", "Europe", "Japan")),
+         across(c(YEAR, MAKE, MODEL), factor)) |>
+    relocate(MAKE, MODEL, ORIGIN, .after=ROW)
+summarise(cardata, n=n())
+head(cardata) |> decorated_dt()
+cardata[46,]
+```
+
+Первые строки показывают, что данные содержат как количественные, так и
+категориальные переменные. 
+
+Среди ключевых: 
+
+- MPG: расход топлива 
+
+- CYLINDER: число цилиндров 
+
+- DISPLACE: объём двигателя 
+
+- HORSEPOW: мощность двигателя 
+
+- WEIGHT: масса автомобиля 
+
+- ACCEL: время разгона до 100 км/ч (секунды) 
+
+- ORIGIN: страна происхождения (1 = США, 2 = Европа,3 = Япония, 
+
+- PRICE: цена автомобиля.
+
+Проверим наличие пропущенных значений:
+
+```{r}
+sapply(cardata, function(x) sum(is.na(x)))
+```
+```{r}
+sum(!complete.cases(cardata))
+```
+
+# Анализ зависимостей
+
+## Визуальный анализ
+
+Логарифмировали: DISPLACE, HORSEPOW, WEIGHT, PRICE
+
+```{r}
+cardata.log <- cardata |> mutate(across(c(DISPLACE, HORSEPOW, WEIGHT, PRICE), log))
+```
+
+Есть ли среди неполных наблюдений выбросы.
+
+```{r message=F, warning=F}
+ggpairs(cardata.log |> mutate(compl = factor(complete.cases(cardata))) |> select(MPG, CYLINDER, DISPLACE, HORSEPOW, ACCEL, WEIGHT, compl),
+       mapping = aes(color = compl),
+       columns = 1:6,#  |> na.omit()
+       lower = list(continuous = "points"), 
+       upper = list(continuous = "points"),       
+       diag = list(continuous = wrap("barDiag", bins = 15))
+        ) +
+  scale_color_manual(values=c("TRUE" = "black", "FALSE" = "red"))
+```
+
+Общий график.
+
+```{r message=F}
+ggpairs(cardata.log |> na.omit() |> select(MPG, CYLINDER, DISPLACE, HORSEPOW, ACCEL, WEIGHT),  # 
+             lower = list(continuous = "points"), 
+             upper = list(continuous = "points"),       
+             diag = list(continuous = wrap("barDiag", bins = 15))
+        ) 
+```
+
+```{r}
+outliers <- c(slice_min(cardata, CYLINDER, n=1)$ROW, 145, (cardata |> filter(MAKE == "MERCEDES"))$ROW)
+cardata |> filter(ROW %in% outliers) |> decorated_dt()
+```
+
+Красный, зелёный, синий --- США, Европа, Япония.
+
+```{r warning=F, message=F}
+ggpairs(
+  data = cardata.log |> na.omit() |> filter(!(ROW %in% outliers)) |> select(ORIGIN, MPG, CYLINDER, DISPLACE, HORSEPOW, ACCEL, WEIGHT, PRICE),
+  mapping = aes(color = ORIGIN, alpha = 0.7),
+  columns = 2:8,
+  upper = list(continuous = wrap("points", stroke = 0.5)),
+  lower = list(continuous = wrap("points", stroke = 0.5)),
+  diag = list(continuous = wrap("barDiag", bins = 15))
+) +
+  scale_color_manual(values=c("USA" = "red", "Europe" = "darkgreen", "Japan" = "blue"))
+```
+
+(Тёмно-)Синий --- 1978; Оранжевый --- 1982
+
+```{r warning=F, message=F}
+ggpairs(
+  data = cardata.log |> na.omit() |> filter(!(ROW %in% outliers)) |> select(YEAR, MPG, CYLINDER, DISPLACE, HORSEPOW, ACCEL, WEIGHT, PRICE),
+  mapping = aes(color = YEAR, alpha = 0.7),
+  columns = 2:8,
+  upper = list(continuous = wrap("points", stroke = 0.5)),
+  lower = list(continuous = wrap("points", stroke = 0.5)),
+  diag = list(continuous = wrap("barDiag", bins = 15))
+) +
+  scale_color_manual(values=c("78" = "#001ce6", "79" = "#7600e6", "80" = "#e600a4",
+                              "81" = "#e60500", "82"  ="#e67b00")) 
+```
+
+```{r warning=F, message=F}
+cardata.log |> na.omit() |>
+      filter(!(ROW %in% outliers), ORIGIN == "USA") |> decorated_dt()
+ggpairs(
+  data = cardata.log |> na.omit() |>
+      filter(!(ROW %in% outliers), ORIGIN == "USA") |>
+      mutate(YEAR=as.numeric(YEAR)),# |>
+      #select(MPG, CYLINDER, DISPLACE, HORSEPOW, ACCEL, YEAR, WEIGHT, PRICE),
+  columns = 5:12,
+  upper = list(continuous = wrap("points", stroke = 0.5)),
+  lower = list(continuous = wrap("points", stroke = 0.5)),
+  diag = list(continuous = wrap("barDiag", bins = 15))
+)
+```
+
+## Анализ главных компонент
+
+```{r}
+cardata.PCA <- cardata.log |> na.omit() |> 
+    filter(!(ROW %in% outliers), ORIGIN == "USA") |>
+    mutate(YEAR=as.numeric(YEAR) + 77)
+names <- cardata.PCA |> mutate(NAME = paste(MAKE, MODEL, paste0("(",ROW,")"), sep=" ")) |> pull(NAME)
+ind <- cardata.PCA|> pull(ROW)
+
+set.seed(42)
+supp_id <- sample(nrow(cardata.PCA), 
+                  nrow(cardata.PCA) / 10)
+
+cardata.PCA.active <- cardata.PCA[-supp_id,c(5:12)] |> as.matrix()
+rownames(cardata.PCA.active) <- ind[-supp_id]
+res.pca <- PCA(cardata.PCA.active[,-c(6,8)], graph = FALSE)
+```
+
+Собственные значения ($\lambda_i$)
+
+```{r}
+get_eigenvalue(res.pca)
+fviz_eig(res.pca, addlabels = TRUE, ylim = c(0, 100))
+```
+
+Координаты признаков ($f_{ij}$). Они же -- собственные векторы (но не $U_i$, потому что не нормированны).
+
+```{r}
+res.pca.var <- get_pca_var(res.pca)
+
+res.pca.var$coord
+fviz_pca_var(res.pca, col.var = "black")
+```
+
+если очень нужны именно собственные векторы ($U_i$), то вот они:
+
+```{r}
+(t(res.pca.var$coord) / sqrt(get_eigenvalue(res.pca)[,"eigenvalue"])[1:5]) |> t()
+```
+
+Квадраты косинусов углов между признаком и главными направлениями ($f_{ij}^2$, при условии, что признаки были нормированы [это делается под капотом по умолчанию])
+
+```{r}
+res.pca.var$cos2
+corrplot(res.pca.var$cos2, is.corr = FALSE)
+```
+
+Вклад каждого признака в дисперсию каждого вектора главных компонент 
+
+Это та же таблица с $\cos^2$, но та была нормированная по сумме в строках, а эта --- по сумме в столбцах.
+
+```{r}
+res.pca.var$contrib
+fviz_pca_var(res.pca, col.var = "contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"))
+```
+
+
+```{r}
+dimdesc(res.pca, axes = c(1, 2), proba=1)
+```
+
+Индивиды на графике. Покрашены по косинусу угла между индивидом и плоскостью первых двух главных компонент.
+
+```{r eval=FALSE, include=FALSE}
+fviz_pca_ind(res.pca, col.ind = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+              geom.ind = "point")
+
+fviz_pca_ind(res.pca,
+             geom.ind = "point",       # points only, no labels
+             col.ind = (cardata.PCA.active[,"YEAR"] |> as.numeric() + 77) |> as.factor(),   # colour by species
+             palette = "jco",          # colourblind-safe journal palette
+             addEllipses = T,        # concentration ellipses
+             legend.title = "Year")
+fviz_pca_ind(res.pca,
+             geom.ind = "point",       # points only, no labels
+             col.ind = (cardata.PCA.active[,"YEAR"] |> as.numeric() + 77) |> as.factor(),   # colour by species
+             palette = "jco",          # colourblind-safe journal palette
+             addEllipses = T,        # concentration ellipses
+             legend.title = "Year")
+```
+
+```{r}
+fviz_pca_biplot(res.pca, repel = TRUE,
+                col.var = "#3a86d4",   # variables
+                col.ind = "#696969")   # individuals
+```
+
+```{r}
+cardata.PCA.act_supp <- cardata.PCA[,c(5:12)] |> as.matrix()
+rownames(cardata.PCA.act_supp) <- names
+res.pca.act_supp <- PCA(cardata.PCA.act_supp[,-6],
+               ind.sup = supp_id,
+               quanti.sup=7,
+               graph=F)
+```
+
+```{r eval=FALSE, include=FALSE}
+res.pca.act_supp$ind.sup$coord
+res.pca.act_supp$quanti.sup$coord
+
+fviz_pca_ind(res.pca.act_supp, col.ind = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+              geom.ind = "point")
+
+fviz_pca_biplot(res.pca.act_supp, repel = TRUE,
+                 geom.ind = "point",
+                col.var = "#3a86d4",   # variables
+                col.ind = "#696969")   # individuals
+```
+
+
+## Возьмём цену
+
+```{r}
+cardata.PCA <- cardata.log |> na.omit() |> 
+    filter(!(ROW %in% outliers), ORIGIN == "USA") |>
+    mutate(YEAR=as.numeric(YEAR) + 77)
+names <- cardata.PCA |> mutate(NAME = paste(MAKE, MODEL, YEAR + 77, paste0("(",ROW,")"), sep=" ")) |> pull(NAME)
+ind <- cardata.PCA |> pull(ROW)
+
+set.seed(42)
+supp_id <- sample(nrow(cardata.PCA), 
+                  nrow(cardata.PCA) / 10)
+
+cardata.PCA.active <- cardata.PCA[-supp_id,c(5:12)] |> as.matrix()
+rownames(cardata.PCA.active) <- ind[-supp_id]
+res.pca <- PCA(cardata.PCA.active[,-c(6)], graph = FALSE)
+```
+
+Собственные значения ($\lambda_i$)
+
+```{r}
+get_eigenvalue(res.pca)
+fviz_eig(res.pca, addlabels = TRUE, ylim = c(0, 100))
+```
+
+Координаты признаков ($f_{ij}$). Они же -- собственные вектора (но не $U_i$, потому что не нормированны).
+
+```{r}
+res.pca.var <- get_pca_var(res.pca)
+
+res.pca.var$coord
+fviz_pca_var(res.pca, col.var = "black")
+```
+
+если очень нужны именно собственные векторы ($U_i$), то вот они:
+
+```{r}
+(t(res.pca.var$coord) / sqrt(get_eigenvalue(res.pca)[,"eigenvalue"])[1:5]) |> t()
+```
+
+Квадраты косинусов углов между признаком и главными направлениями ($f_{ij}^2$, при условии, что признаки были нормированы [это делается под капотом по умолчанию])
+
+```{r}
+res.pca.var$cos2
+corrplot(res.pca.var$cos2, is.corr = FALSE)
+```
+
+Вклад каждого признака в дисперсию каждого вектора главных компонент 
+
+Это та же таблица с $\cos^2$, но та была нормированная по сумме в строках, а эта --- по сумме в столбцах.
+
+```{r}
+res.pca.var$contrib
+fviz_pca_var(res.pca, col.var = "contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"))
+```
+
+
+```{r}
+dimdesc(res.pca, axes = c(1, 2, 3), proba=1)
+```
+
+Индивиды на графике. Покрашены по косинусу угла между индивидом и плоскостью первых двух главных компонент.
+
+```{r eval=FALSE, include=FALSE}
+fviz_pca_ind(res.pca, col.ind = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+              geom.ind = "point")
+
+fviz_pca_ind(res.pca,
+             geom.ind = "point",       # points only, no labels
+             col.ind = (cardata.PCA.active[,"YEAR"]) |> as.factor(),   # colour by species
+             palette = "jco",          # colourblind-safe journal palette
+             addEllipses = F,        # concentration ellipses
+             legend.title = "Year")
+fviz_pca_ind(res.pca,
+             geom.ind = "point",       # points only, no labels
+             col.ind = (cardata.PCA.active[,"YEAR"]) |> as.factor(),   # colour by species
+             palette = "jco",          # colourblind-safe journal palette
+             addEllipses = T,        # concentration ellipses
+             legend.title = "Year")
+```
+
+```{r}
+fviz_pca_biplot(res.pca, repel = TRUE,
+                col.var = "#3a86d4", 
+                gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),# variables
+                col.ind = "cos2")   # individuals
+```
+
+```{r eval=FALSE, include=FALSE}
+cardata.PCA.act_supp <- cardata.PCA[,c(5:12)] |> as.matrix()
+rownames(cardata.PCA.act_supp) <- names
+res.pca.act_supp <- PCA(cardata.PCA.act_supp[,-6],
+               ind.sup = supp_id,
+               quanti.sup=7,
+               graph=F)
+```
+
+
+## По всем странамм
+
+```{r}
+cardata.PCA <- cardata.log |> na.omit() |> 
+    filter(!(ROW %in% outliers)) |>
+    mutate(YEAR=as.numeric(YEAR) + 77,
+           ORIGIN = as.numeric(ORIGIN))
+names <- cardata.PCA |> mutate(NAME = paste(MAKE, MODEL, YEAR + 77, paste0("(",ROW,")"), sep=" ")) |> pull(NAME)
+
+set.seed(42)
+supp_id <- sample(nrow(cardata.PCA), 
+                  nrow(cardata.PCA) / 10)
+
+cardata.PCA.active <- cardata.PCA[-supp_id,c(4:12)] |> as.matrix()
+rownames(cardata.PCA.active) <- names[-supp_id]
+res.pca <- PCA(cardata.PCA.active[,-c(1, 7)], graph = FALSE)
+```
+
+Собственные значения ($\lambda_i$)
+
+```{r}
+get_eigenvalue(res.pca)
+fviz_eig(res.pca, addlabels = TRUE, ylim = c(0, 100))
+```
+
+Координаты признаков ($f_{ij}$). Они же -- собственные вектора (но не $U_i$, потому что не нормированны).
+
+```{r}
+res.pca.var <- get_pca_var(res.pca)
+
+res.pca.var$coord
+fviz_pca_var(res.pca, col.var = "black")
+```
+
+если очень нужны именно собственные векторы ($U_i$), то вот они:
+
+```{r}
+(t(res.pca.var$coord) / sqrt(get_eigenvalue(res.pca)[,"eigenvalue"])[1:5]) |> t()
+```
+
+Квадраты косинусов углов между признаком и главными направлениями ($f_{ij}^2$, при условии, что признаки были нормированы [это делается под капотом по умолчанию])
+
+```{r}
+res.pca.var$cos2
+corrplot(res.pca.var$cos2, is.corr = FALSE)
+```
+
+Вклад каждого признака в дисперсию каждого вектора главных компонент 
+
+Это та же таблица с $\cos^2$, но та была нормированная по сумме в строках, а эта --- по сумме в столбцах.
+
+```{r}
+res.pca.var$contrib
+fviz_pca_var(res.pca, col.var = "contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"))
+```
+
+
+```{r}
+dimdesc(res.pca, axes = c(1, 2, 3), proba=1)
+```
+
+Индивиды на графике. Покрашены по косинусу угла между индивидом и плоскостью первых двух главных компонент.
+
+```{r}
+fviz_pca_ind(res.pca, col.ind = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+              geom.ind = "point")
+
+fviz_pca_ind(res.pca,
+             geom.ind = "point",       # points only, no labels
+             col.ind = (cardata.PCA.active[,"YEAR"]) |> as.factor(),   # colour by species
+             palette = "jco",          # colourblind-safe journal palette
+             addEllipses = F,        # concentration ellipses
+             legend.title = "Year")
+fviz_pca_ind(res.pca,
+             geom.ind = "point",       # points only, no labels
+             col.ind = (cardata.PCA.active[,"YEAR"]) |> as.factor(),   # colour by species
+             palette = "jco",          # colourblind-safe journal palette
+             addEllipses = T,        # concentration ellipses
+             legend.title = "Year")
+```
+
+```{r}
+fviz_pca_biplot(res.pca, repel = TRUE,
+                 geom.ind = "point",
+                col.var = "#3a86d4",   # variables
+                col.ind = "#696969")   # individuals
+```
+
+```{r}
+cardata.PCA.act_supp <- cardata.PCA[,c(5:12)] |> as.matrix()
+rownames(cardata.PCA.act_supp) <- names
+res.pca.act_supp <- PCA(cardata.PCA.act_supp[,-6],
+               ind.sup = supp_id,
+               quanti.sup=7,
+               graph=F)
+```
+
+

@@ -1,0 +1,347 @@
+---
+title: "PRESTIGE"
+author: "Alexander Khramov"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(DT)
+library(readxl)
+library(ggplot2)
+library(GGally)
+library(dplyr)
+library(car)
+library(ppcor)
+library(lm.beta)
+library(ellipse)
+
+redundancy_summary <- function(model, data) {
+  # Get variable names
+  vars <- names(coef(model))[-1]  # Remove intercept
+  
+  # VIF and tolerance
+  vif_vals <- vif(model)
+  if (is.matrix(vif_vals)) {
+    # For models with factors
+    vif_df <- data.frame(
+      Variable = rownames(vif_vals),
+      #VIF = vif_vals[, 1],
+      Tolerance = 1 / vif_vals[, 1]
+    )
+  } else {
+    vif_df <- data.frame(
+      Variable = names(vif_vals),
+      #VIF = vif_vals,
+      Tolerance = 1 / vif_vals
+    )
+  }
+  
+  # Partial correlations with response
+  response_var <- as.character(formula(model))[2]
+  
+  # Select only numeric columns for partial correlations
+  numeric_data <- data[, sapply(data, is.numeric)]
+  
+  # Calculate partial correlations
+  pcor_result <- pcor(numeric_data)
+  
+  # Extract partial correlations with response
+  partial_cors <- data.frame(
+    Variable = vars,
+    Partial_Cor = pcor_result$estimate[vars, response_var]
+  )
+  
+  # Combine results
+  result <- merge(vif_df, partial_cors, by = "Variable")
+  
+  return(result[order(-result$Partial_Cor), ])
+}
+```
+
+# Обзор данных
+
+Загрузка данных:
+
+```{r}
+prestige <- read_excel("PRESTIGE.xls") |>
+    rename(OCCUPATION = ...1) |> 
+    relocate(SUICIDE, .after = last_col())
+```
+
+Обзор:
+
+OCCUPATION --- occupation (no)
+
+PRESTIGE   --- the NORC occupational prestige rating
+
+SUICIDE    --- the male suicide rate (amongst males aged 20-64) (стандартно на 100,000)
+
+INCOME     --- the median income ($) (в год)
+
+SCHOOL     --- the median number of school years completed (1-8: elementary school, 9-12: high school, 13-16: college)
+
+```{r}
+prestige |> summary()
+prestige |> complete.cases() |> sum()
+prestige |> datatable()
+```
+
+Пояснения, чтобы не потерять:
+
+(AI overview) Bookkeepers manage the day-to-day recording of financial transactions, such as tracking sales, purchases, and payroll, to ensure accurate financial records. Accountants take this data to analyze performance, provide tax planning, and create strategic financial forecasts. Bookkeepers focus on record-keeping, while accountants focus on interpretation.
+
+Motormen (street,..) --- водитель трамвая
+
+```{r message=F, warning=F}
+ggpairs(prestige |> dplyr::select(-OCCUPATION),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=6)),
+    ) 
+```
+
+# Обработка
+
+Логарифмируем: INCOME, PRESTIGE, SUICIDE
+
+```{r}
+prestige.log <- prestige |> 
+    mutate(INCOME.LOG = log(INCOME), PRESTIGE.LOG=log(PRESTIGE), SCHOOL.LOG = log(SCHOOL), SUICIDE.LOG = log(SUICIDE),
+                                   .after=1)
+```
+
+```{r message=F, warning=F}
+ggpairs(prestige.log |> dplyr::select(2:3, SCHOOL, SUICIDE),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=6)),
+       title = "Не логарифмируем SUICIDE"
+    ) 
+```
+
+```{r message=F, warning=F}
+ggpairs(prestige.log |> dplyr::select(2:3, SCHOOL, 5),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=6)),
+       title = "Логарифмируем SUICIDE"
+    ) 
+```
+
+# Удалим выбросы
+
+Кажется видны два выброса на графиках: PRESTIGE/INCOME.LOG (высокий престиж, маленькая зарплата), и на графиках SUICIDE индивид с самым большим показателем.
+
+Эти два: священнослужители и менеджеры в производстве (обрабатывающей промышленности). Кстати, это два индивида с наибольшим и наименьшим значением SUICIDE.
+
+```{r}
+outliers <- c("Manager1(manufactur)", "Clergymen", "Physicians&Surgeons", "Dentists", "Lawyers&Judges", "Architects")
+#outliers <- c("Clergymen", "Physicians&Surgeons", "Dentists", "Lawyers&Judges", "Architects")
+#outliers <- c("Manager1(manufactur)", "Clergymen")
+
+prestige.log.outlier <- prestige.log |> filter(!(OCCUPATION %in% outliers))
+```
+
+```{r message=F, warning=F}
+ggpairs(prestige.log.outlier |> dplyr::select(2:3, SCHOOL,5),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=6)),
+    ) 
+```
+
+## Ручной отбор признаков
+
+```{r}
+model <- lm(SUICIDE.LOG ~ INCOME.LOG + PRESTIGE.LOG + SCHOOL, prestige.log.outlier)
+summary(model)
+AIC(model)
+redundancy_summary(model, prestige.log.outlier)
+```
+
+R^2 = 0.2641; adj. R^2 = 0.1792; Значим только коэффициент при SCHOOL. AIC = 24.74
+
+Кандидат на вылет: INCOME.LOG
+
+```{r}
+model <- lm(SUICIDE.LOG ~ PRESTIGE.LOG + SCHOOL, prestige.log.outlier)
+model |> summary()
+AIC(model)
+redundancy_summary(model, prestige.log.outlier)
+```
+
+R^2 уменьшился всего на 0.0001, adjusted R^2 увеличился на 0.03. Все коэффициенты стали значимы. Общий p-value уменьшился.
+
+AIC уменьшился (это хорошо).
+
+Попробуем вместо INCOME.LOG выкинуть PRESTIGE.LOG.
+
+```{r}
+model <- lm(SUICIDE.LOG ~ INCOME.LOG + SCHOOL, prestige.log.outlier)
+model |> summary()
+AIC(model)
+#redundancy_summary(model, prestige.log.outlier)
+```
+
+По всем параметрам хуже (а судя по AIC --- стало хуже чем было)
+
+```{r}
+model <- lm(SUICIDE.LOG ~ PRESTIGE.LOG + SCHOOL, prestige.log.outlier)
+confint(model)
+confidenceEllipse(model, 
+                  which.coef = c("PRESTIGE.LOG", "SCHOOL"),
+                  levels = c(0.95),
+                  col = c("steelblue"))
+```
+
+```{r}
+model <- lm(SUICIDE.LOG ~ SCHOOL, prestige.log.outlier)
+model |> summary()
+AIC(model)
+```
+
+Все показатели ухудшились.
+
+```{r}
+model <- lm(SUICIDE.LOG ~ 1, prestige.log.outlier)
+model |> summary()
+AIC(model)
+```
+
+Для проверки удалим оставшийся.
+
+## Автоматический отбор
+
+Backward:
+
+```{r}
+model <- lm(SUICIDE.LOG ~ INCOME.LOG + PRESTIGE.LOG + SCHOOL, prestige.log.outlier)
+step <- stepAIC(model, scope=list(upper = ~ INCOME.LOG + PRESTIGE.LOG + SCHOOL, lower = ~1), trace=T, direction="backward")
+```
+
+Почему разный AIC? 
+
+```{r}
+AIC(model) - nrow(prestige.log.outlier) * (1 + log(2*pi)) - 2
+```
+
+Forward:
+
+```{r}
+model <- lm(SUICIDE.LOG ~ 1, prestige.log.outlier)
+step <- stepAIC(model, scope=list(upper = ~ INCOME.LOG + PRESTIGE.LOG + SCHOOL, lower = ~1), trace=T, direction="forward")
+```
+
+# Не удалим выбросы
+
+Точнее, удалим только выбросы на графиках с SUICIDE
+
+```{r}
+#outliers <- c("Manager1(manufactur)", "Clergymen", "Physicians&Surgeons", "Dentists", "Lawyers&Judges", "Architects")
+#outliers <- c("Clergymen", "Physicians&Surgeons", "Dentists", "Lawyers&Judges", "Architects")
+outliers <- c("Manager1(manufactur)", "Clergymen")
+
+prestige.log.outlier <- prestige.log |> filter(!(OCCUPATION %in% outliers))
+```
+
+```{r message=F, warning=F}
+ggpairs(prestige.log.outlier |> dplyr::select(2:3, SCHOOL,5),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=6)),
+    ) 
+```
+
+
+## Ручной отбор признаков
+
+```{r}
+model <- lm(SUICIDE.LOG ~ INCOME.LOG + PRESTIGE.LOG + SCHOOL, prestige.log.outlier)
+summary(model)
+AIC(model)
+redundancy_summary(model, prestige.log.outlier)
+```
+
+R^2 = 0.2366; adj. R^2 = 0.1603; Значим только коэффициент при SCHOOL. AIC = 27.51
+
+Кандидат на вылет: INCOME.LOG или PRESTIGE.LOG. Попробуем оба.
+
+```{r}
+model <- lm(SUICIDE.LOG ~ PRESTIGE.LOG + SCHOOL, prestige.log.outlier)
+model |> summary()
+AIC(model)
+#redundancy_summary(model, prestige.log.outlier)
+```
+
+R^2 уменьшился сильно, adjusted R^2 уменьшился на 0.04. Все коэффициенты стали значимы. Общий p-value слегка увеличился.
+
+AIC увеличился.
+
+Попробуем вместо INCOME.LOG выкинуть PRESTIGE.LOG.
+
+```{r}
+model <- lm(SUICIDE.LOG ~ INCOME.LOG + SCHOOL, prestige.log.outlier)
+model |> summary()
+AIC(model)
+redundancy_summary(model, prestige.log.outlier)
+```
+
+R^2 уменьшился не так сильно, adjusted R^2 слегка увеличился. Все коэффициенты кроме свободного стали значимы. Общий p-value уменьшился.
+
+AIC уменьшился.
+
+```{r}
+confint(model)
+confidenceEllipse(model, 
+                  which.coef = c("INCOME.LOG", "SCHOOL"),
+                  levels = c(0.95),
+                  col = c("steelblue"))
+```
+
+```{r}
+lm.beta(model)
+```
+
+```{r}
+model <- lm(SUICIDE.LOG ~ SCHOOL, prestige.log.outlier)
+model |> summary()
+AIC(model)
+```
+
+Все показатели ухудшились.
+
+```{r}
+model <- lm(SUICIDE.LOG ~ 1, prestige.log.outlier)
+model |> summary()
+AIC(model)
+```
+
+Для проверки удалим оставшийся.
+
+## Автоматический отбор
+
+Backward:
+
+```{r}
+model <- lm(SUICIDE.LOG ~ INCOME.LOG + PRESTIGE.LOG + SCHOOL, prestige.log.outlier)
+step <- stepAIC(model, scope=list(upper = ~ INCOME.LOG + PRESTIGE.LOG + SCHOOL, lower = ~1), trace=T, direction="backward")
+```
+
+Forward:
+
+```{r}
+model <- lm(SUICIDE.LOG ~ 1, prestige.log.outlier)
+step <- stepAIC(model, scope=list(upper = ~ INCOME.LOG + PRESTIGE.LOG + SCHOOL, lower = ~1), trace=T, direction="forward")
+```
+
+
+
+
+
+
+
+
+
+

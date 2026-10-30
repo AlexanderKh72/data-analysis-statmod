@@ -1,0 +1,1250 @@
+---
+title: "Анализ зверюшек"
+author: "Alexander Khramov"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width=8, fig.height=6, fig.dpi=300, dev="svg")
+library(DT)
+library(readxl)
+library(ggplot2)
+library(GGally)
+library(ppcor)
+library(dplyr)
+library(nortest)
+library(car)
+library(moments)
+library(qqplotr)
+library(corrplot)
+library(lm.beta)
+library(ellipse)
+load("data_processed.RData")
+
+pval_to_stars <- function(pval_matrix) {
+  stars_matrix <- matrix("", nrow = nrow(pval_matrix), ncol = ncol(pval_matrix))
+  
+  stars_matrix[pval_matrix < 0.001] <- "***"
+  stars_matrix[pval_matrix >= 0.001 & pval_matrix < 0.01] <- "** "
+  stars_matrix[pval_matrix >= 0.01 & pval_matrix < 0.05] <- "*  "
+  stars_matrix[pval_matrix >= 0.05 & pval_matrix < 0.10] <- ".  "
+  stars_matrix[pval_matrix >= 0.10] <- "   "
+  
+  dimnames(stars_matrix) <- dimnames(pval_matrix)
+  return(stars_matrix)
+}
+
+format_pcor <- function(pcor_result, digits = 3, sign_prefix = "space") {
+  est <- pcor_result$estimate
+  pval <- pcor_result$p.value
+  
+  # Create significance codes
+  stars <- matrix("", nrow = nrow(pval), ncol = ncol(pval))
+  stars[pval < 0.001] <- "***"
+  stars[pval >= 0.001 & pval < 0.01] <- "** "
+  stars[pval >= 0.01 & pval < 0.05] <- "*  "
+  stars[pval >= 0.05 & pval < 0.10] <- ".  "
+  stars[pval >= 0.10] <- "   "
+  
+  # Format with sign prefix
+  result <- matrix("", nrow = nrow(est), ncol = ncol(est))
+  
+  for (i in 1:nrow(est)) {
+    for (j in 1:ncol(est)) {
+      #if (i == j) {
+      #  result[i, j] <- "-"
+      #} else {
+        value <- est[i, j]
+        star <- stars[i, j]
+        
+        # Add prefix based on option
+        if (sign_prefix == "space" && value > 0) {
+          result[i, j] <- sprintf(" %.3f%s", value, star)
+        } else if (sign_prefix == "plus" && value > 0) {
+          result[i, j] <- sprintf("+%.3f%s", value, star)
+        } else {
+          result[i, j] <- sprintf("%.3f%s", value, star)
+        }
+      #}
+    }
+  }
+  
+  dimnames(result) <- dimnames(est)
+  return(result)
+}
+```
+
+# Предварительный анализ данных
+
+При считывании данных заменим значения -999 на пропуски (как указано в описании данных).
+
+```{r}
+sleep <- read_excel("SLEEP_shortname.xls", na=c("", "-999")) |> rename(NAME = ...1, BODY_WEIGHT = BODY_WEI, BRAIN_WEIGHT = BRAIN_WE) |> mutate(across(ends_with("_IND"), as.factor)) 
+```
+
+62 наблюдения с 11 признаками (включая индексирующий). Пропущенные значения, отмеченные как -999, отловлены на этапе считывания данных (судя по значению Min для переменных).
+
+## Значения и типы признаков
+
+### Значения признаков
+
+NAME --- название вида;
+
+BODY_WEIGHT --- масса тела в кг;
+
+BRAIN_WEIGHT --- масса мозга в граммах;
+
+SLOWWAVE --- продолжительность фазы медленного сна (сны не снятся) (часы/день);
+
+PARADOX --- продолжительность фазы быстрого сна (сны снятся) (часы/день);
+
+SLEEP --- общая продолжительность сна (часы/день), равна сумме SLOWWAVE и PARADOX;
+
+LIFESPAN --- наибольшая продолжительность жизни (в годах);
+
+GESTTIME --- продолжительность беременности (в днях);
+
+PRED_IND --- индекс шанса стать жертвой ("индекс хищничества"), где 1 --- наименьшая вероятность стать жертвой хищника, 5 --- наибольшая;
+
+EXP_IND --- индекс воздействия на сон, где 1 --- наименьшее воздействие на сон (защищённое место для сна), 2 --- наибольшее;
+
+DANG_IND --- общий индекс опасности, складывается из прошлых двух и другой информации, где 1 --- наименьшая опасность (от других животных), 5 --- наибольшая.
+
+### Типы признаков
+
+Категориальная переменная (выполняющая функция индексирующей): NAME.
+
+К категориальным/порядковым относятся последние три признака: PRED_IND, EXP_IND, DANG_IND.
+
+Остальные относятся к количественным, предположительно непрерывным. Для проверки посчитаем для них частоту моды и количество уникальных значений.
+
+```{r}
+sleep |> select(-NAME, -(9:11)) |> summarise(across(everything(), list(mode.freq = function(x) max(table(x)))))
+sleep |> select(-NAME, -(9:11)) |> summarise(across(everything(), n_distinct))
+sleep |> select(-NAME, -(9:11)) |> summarise(across(everything(), function(x) n_distinct(x) / sum(!is.na(x))))
+```
+
+Для каждой переменной мода повторяется не более 3 раз и число уникальных значений близко к количеству наблюдений. Далее мы будем считать эти переменные непрерывными.
+
+### Пропущенные значения
+
+Проверим количество пропущенных значений по каждому признаку и количество полных наблюдений.
+
+```{r}
+sleep |> summarise(across(everything(), ~ sum(is.na(.))))
+sleep |> complete.cases() |> sum()
+(!complete.cases(sleep$SLOWWAVE) & !complete.cases(sleep$PARADOX)) |> sum()
+(complete.cases(sleep$SLOWWAVE) & !complete.cases(sleep$PARADOX)) |> sum()
+```
+
+Полных наблюдений 42 (около двух третей). Больше всего пропущенных значений в признаках SLOWWAVE и PARADOX (14 и 12 соответственно), причём пропуск значения в PARADOX означает пропуск значения в SLOWWAVE.
+
+```{r}
+sleep |> select(NAME, SLOWWAVE, PARADOX, SLEEP) |> filter(!complete.cases(PARADOX, SLEEP))
+```
+
+Дополнительно проверим выполнение свойства SLOWWAVE + PARADOX = SLEEP
+
+```{r}
+sleep |> filter(complete.cases(SLOWWAVE, PARADOX, SLEEP)) |> filter(abs(SLOWWAVE + PARADOX - SLEEP) > 0.01)
+```
+
+### Простейшие статистики
+
+```{r}
+head(sleep)
+sleep |> summary()
+```
+
+Среди минимум и максимумов нет явно некорректных значений. 
+
+Для признаков BODY_WEIGHT и BRAIN_WEIGHT, а также LIFESPAN и GESTTIME значение медианы и среднего резко отличается, что может говорить о несимметричности распределений.
+
+## Визуализация изначальных данных
+
+```{r message=F, warning=F}
+ggpairs(sleep |> select(-NAME),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=12)),
+    ) 
+```
+
+Ранее отмеченные признаки BODY_WEIGHT, BRAIN_WEIGHT, LIFESPAN и GESTTIME действительно имеют распределения с хвостом вправо.
+
+Обратим внимание на признак BODY_WEIGHT. Построем квантили для этого признака.
+
+```{r message=FALSE, warning=FALSE}
+mean(sleep$BODY_WEIGHT)
+quantile(sleep$BODY_WEIGHT, probs = seq(0, 1, 0.1))
+```
+
+Среднее значение близко к 0.9-квантили, что говорит о тяжёлом хвосте справа.
+
+Прежде чем продолжить визуальный анализ попробуем прологарифмировать эти признаки.
+
+```{r, eval=FALSE}
+sleep.log <- sleep |> mutate(across(c(BODY_WEIGHT, BRAIN_WEIGHT, LIFESPAN, GESTTIME), log)) |>
+    rename_with(~ paste0(., ".log"), c(BODY_WEIGHT, BRAIN_WEIGHT, LIFESPAN, GESTTIME))
+```
+
+```{r}
+summary(sleep.log)
+```
+
+После логарифмирования среднее значения и медиана признаков стали близки.
+
+## Визуализация логарифмированных данных
+
+```{r message=F, warning=F}
+ggpairs(sleep.log |> select(-NAME),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=12)),
+    ) 
+```
+
+После логорифмирования распределения действительно стали более похожи на нормальные.
+
+## Выбросы
+
+На графиках видны 3 индивида с наибольшим значением PARADOX;
+
+Выделяющаяся группа из индивидов с наибольшим значением PARADOX: водяной и северно-американскоий опоссумы (Water opossum, N. Amer. opossum) и гигантский броненосец (Giant armadillo).
+
+```{r, eval=FALSE}
+sleep.log.outl <- sleep.log |> filter(!(NAME %in% outliers.log.NAME))
+```
+
+```{r message=F, warning=F}
+ggpairs(sleep.log |> filter(!(NAME %in% c("Water opossum", "N. Amer. opossum", "Giant armadillo"))) |> select(-NAME),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=12)),
+    ) 
+```
+
+На нескольких графиках (напр., BRAIN_WEIGHT-LIFESPAN) видны два выброса. Попробуем их определить.
+
+```{r}
+sleep.log |> slice_max(LIFESPAN.log - BRAIN_WEIGHT.log, n=5)
+```
+
+Ими оказались Little brown bat и Big brown bat.
+
+```{r}
+sleep |> slice_max(SLEEP, n=7)
+```
+
+```{r}
+sleep |> filter(endsWith(NAME, "bat"))
+```
+
+Они же оказались самыми спящими животными, вместе с ещё тремя видами, определёнными как выбросы.
+
+```{r message=F, warning=F, eval=FALSE}
+outliers.log.NAME <- c("Water opossum", "Giant armadillo", "N. Amer. opossum", "Little brown bat", "Big brown bat")  #  "African elephant", "Asian elephant", "Man", 
+sleep.log.outl <- sleep.log |> filter(!(NAME %in% outliers.log.NAME))
+```
+```{r}
+ggpairs(sleep.log |> filter(!(NAME %in% outliers.log.NAME)) |> select(-NAME),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=12)),
+    )
+```
+
+## Неоднородности
+
+Посмотрим внимательнее на ящики с усами относительно переменной EXP_IND.
+
+### BODY_WEIGHT
+
+```{r}
+ggplot(sleep.log |> filter(!(NAME %in% outliers.log.NAME)), aes(x=EXP_IND, y=BODY_WEIGHT.log)) + 
+    geom_boxplot() +
+    stat_summary(
+        fun = mean, 
+        geom = "point", 
+        shape = 18,        # Diamond shape for mean
+        size = 3, 
+        color = "steelblue",
+        position = position_dodge(0.9)
+    )
+```
+
+Ящики с усами показывают, что этот признак монотонен (возрастает) по значению EXP_IND.
+
+Обратим внимание на выброс в в группе EXP_IND = 2.
+
+```{r}
+sleep |> filter(!(NAME %in% outliers.log.NAME)) |> filter(complete.cases(BODY_WEIGHT)) |> filter(EXP_IND == 2) |> arrange((BODY_WEIGHT)) |> head(5)
+```
+
+Самый маленький индивид --- короткохвостая бурозубка (Short-tailed shrew).
+
+### BRAIN_WEIGHT
+
+```{r}
+ggplot(sleep.log |> filter(!(NAME %in% outliers.log.NAME)), aes(x=EXP_IND, y=BRAIN_WEIGHT.log)) + 
+    geom_boxplot() +
+    stat_summary(
+        fun = mean, 
+        geom = "point", 
+        shape = 18,
+        size = 3,
+        color = "steelblue",
+        position = position_dodge(0.9)
+    )
+```
+
+Ящики с усами показывают, что этот признак монотонен (возрастает) по значению EXP_IND.
+
+Обратим внимание на выброс в группе EXP_IND = 2.
+
+```{r}
+sleep |> filter(!(NAME %in% outliers.log.NAME)) |> filter(complete.cases(BRAIN_WEIGHT)) |> filter(EXP_IND == 2) |> arrange(BRAIN_WEIGHT) |> head(5)
+```
+
+Самый маленький индивид --- короткохвостая бурозубка (Short-tailed shrew).
+
+В группе EXP_IND = 4 число индивидов слишком мало (всего 5), чтобы делать выводы о том, что выделяющиеся точки являются выбросами.
+
+```{r}
+sleep |> filter(!(NAME %in% outliers.log.NAME)) |> filter(complete.cases(BRAIN_WEIGHT, EXP_IND)) |> group_by(EXP_IND) |> summarise(n = n())
+```
+
+### SLOWWAVE
+
+```{r}
+ggplot(sleep.log |> filter(!(NAME %in% outliers.log.NAME)), aes(x=EXP_IND, y=SLOWWAVE)) + 
+    geom_boxplot() +
+    stat_summary(
+        fun = mean, 
+        geom = "point", 
+        shape = 18,
+        size = 3,
+        color = "steelblue",
+        position = position_dodge(0.9)
+    )
+```
+
+Ящики с усами показывают, что этот признак монотонен (убывает) по значению EXP_IND, не считая группы EXP_IND = 4 (имеющей малое число наблюдений).
+
+Обратим внимание на выброс в группе EXP_IND = 5.
+
+```{r}
+sleep |> filter(!(NAME %in% outliers.log.NAME)) |> filter(complete.cases(SLOWWAVE)) |> filter(EXP_IND == 5) |> arrange(desc(SLOWWAVE))
+```
+
+Обнаруженный вид с более продолжительной фазой медленного сна --- кролик (Rabbit).
+
+Так как размер выборки в для данного значения индекса равен 6, не имеет большого смысла убирать этот выброс.
+
+### PARADOX
+
+```{r}
+ggplot(sleep.log |> filter(!(NAME %in% outliers.log.NAME)), aes(x=EXP_IND, y=PARADOX)) + 
+    geom_boxplot() +
+    stat_summary(
+        fun = mean, 
+        geom = "point", 
+        shape = 18,
+        size = 3,
+        color = "steelblue",
+        position = position_dodge(0.9)
+    )
+```
+
+Ящики с усами показывают, что этот признак монотонен (убывает) по значению EXP_IND, не считая группы EXP_IND = 4 (имеющей малое число наблюдений).
+
+Обратим внимание на выброс в группе EXP_IND = 1.
+
+```{r}
+sleep |> filter(!(NAME %in% outliers.log.NAME)) |> filter(complete.cases(PARADOX)) |> filter(EXP_IND == 1) |> arrange((PARADOX))
+```
+
+Обруженный вид с более короткой фазой бфстрого сна --- древесный даман (Tree hyrax).
+
+```{r}
+ggplot(sleep.log |> filter(!(NAME %in% c(outliers.log.NAME, "Tree hyrax"))), aes(x=EXP_IND, y=PARADOX)) + 
+    geom_boxplot() +
+    stat_summary(
+        fun = mean, 
+        geom = "point", 
+        shape = 18,        # Diamond shape for mean
+        size = 3, 
+        color = "steelblue",
+        position = position_dodge(0.9)
+    )
+```
+
+### SLEEP
+
+```{r}
+ggplot(sleep.log |> filter(!(NAME %in% outliers.log.NAME)), aes(x=EXP_IND, y=SLEEP)) + 
+    geom_boxplot() +
+    stat_summary(
+        fun = mean, 
+        geom = "point", 
+        shape = 18,
+        size = 3,
+        color = "steelblue",
+        position = position_dodge(0.9)
+    )
+```
+
+Ящики с усами показывают, что этот признак монотонен (убывает) по значению EXP_IND, не считая группы EXP_IND = 4 (имеющей малое число наблюдений).
+
+### LIFESPAN
+
+```{r}
+ggplot(sleep.log |> filter(!(NAME %in% outliers.log.NAME)), aes(x=EXP_IND, y=LIFESPAN.log)) + 
+    geom_boxplot() +
+    stat_summary(
+        fun = mean, 
+        geom = "point", 
+        shape = 18,
+        size = 3,
+        color = "steelblue",
+        position = position_dodge(0.9)
+    )
+```
+
+Ящики с усами показывают, что этот признак монотонен (возрастает) по значению EXP_IND, не считая группы EXP_IND = 4 (имеющей малое число наблюдений).
+
+Обратим внимание на выброс в группе EXP_IND = 1.
+
+```{r}
+sleep |> filter(!(NAME %in% outliers.log.NAME)) |> filter(complete.cases(LIFESPAN)) |> filter(EXP_IND == 1) |> arrange(desc(LIFESPAN))
+```
+
+Обруженный вид с большой продолжительностью жизни --- человек. 
+
+### GESTTIME
+
+```{r}
+ggplot(sleep.log |> filter(!(NAME %in% outliers.log.NAME)), aes(x=EXP_IND, y=GESTTIME.log)) + 
+    geom_boxplot() +
+    stat_summary(
+        fun = mean, 
+        geom = "point", 
+        shape = 18,
+        size = 3,
+        color = "steelblue",
+        position = position_dodge(0.9)
+    )
+```
+
+Ящики с усами показывают, что этот признак монотонен (возрастает) по значению EXP_IND, не считая группы EXP_IND = 4 (имеющей малое число наблюдений).
+
+Обратим внимание на выброс в группе EXP_IND = 1.
+
+```{r}
+sleep |> filter(!(NAME %in% outliers.log.NAME)) |> filter(complete.cases(GESTTIME)) |> filter(EXP_IND == 1) |> arrange(desc(GESTTIME))
+```
+
+И этот индивид --- человек, как и в прошлом случае.
+
+# О виде распределений и о сравнении распределений
+
+Рассмотрим pairs-plot и расскрасим наблюдения по значениям EXP_IND.
+
+```{r message=FALSE, warning=FALSE}
+ggpairs(sleep.log |> filter(!(NAME %in% outliers.log.NAME)) |> select(-NAME, -PRED_IND, -DANG_IND),
+       mapping = aes(color = EXP_IND, alpha = 0.7),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),
+       diag = list(continuous = wrap("barDiag", bins=12)),
+    ) 
+```
+
+Заметим, что наблюдения в группе EXP_IND = 5 (фиолетовые) находятся поблизости в одной части облака точек, в то время как точки из групп EXP_IND = 1 и EXP_IND = 2 (красные и зелёные) перемешаны друг с другом, но находятся вместе в противоположной части облака относительно фиолетовых.
+
+Рассмотрим количество наблюдений по группам.
+
+```{r}
+sleep.log.outl |> filter(complete.cases(EXP_IND)) |> group_by(EXP_IND) |> summarise(n = n())
+```
+
+А также посмотрим на несколько наблюдений из каждой группы.
+
+```{r}
+sleep.log.outl |> filter(EXP_IND == 1) |> head(n=5)
+sleep.log.outl |> filter(EXP_IND == 2) |> head(n=5)
+sleep.log.outl |> filter(EXP_IND == 3) |> head(n=5)
+sleep.log.outl |> filter(EXP_IND == 4) |> head(n=5)
+sleep.log.outl |> filter(EXP_IND == 5) |> head(n=5)
+```
+
+Группы EXP_IND = 3 и EXP_IND = 4 имеют очень мало наблюдений, поэтому их не имеент смысла рассматривать по отдельности.
+
+В дальнейшем мы будем рассматривать группы EXP_IND = 1, EXP_IND = 2 и EXP_IND $\geq$ 3.
+
+```{r}
+sleep.log.cut <- sleep.log.outl |> mutate(EXP_IND.cut = as.factor(pmin(3, as.numeric(EXP_IND))))
+```
+
+Из каждой группы признаков выберем по одному, и для каждого из них проверим гипотезу о совпадении распределений этого признака по группам. 
+
+## SLEEP
+
+Сперва проверим число полных наблюдений по данному признаку по группам.
+
+```{r}
+sleep.log.cut |> filter(complete.cases(SLEEP, EXP_IND)) |> group_by(EXP_IND.cut) |> summarise(n = n())
+```
+
+### Проверка на нормальность
+
+Перед проверками на совпадение распределений, надо проверить выборки на нормальность.
+
+#### Normal probability plot
+
+Построим normal probability plot для всей выборки и по группам.
+
+ЗДЕСЬ И ДАЛЕЕ: линия на normal probability plot --- это линия проходящая через точки 1ой и 3ей квартилей (0.25 и 0.75-квантилей).
+
+```{r}
+sleep.log.cut |> filter(complete.cases(SLEEP)) |> ggplot() + aes(sample = SLEEP) +
+    stat_qq() +
+  ggplot2::stat_qq_line(color = "red", linewidth = 1) +
+    labs(title = "All sample")
+
+sleep.log.cut |> filter(complete.cases(SLEEP) & (EXP_IND.cut == 1)) |> ggplot() + aes(sample = SLEEP) +
+    stat_qq() +
+  ggplot2::stat_qq_line(color = "red", linewidth = 1) +
+    labs(title = "EXP_IND = 1")
+
+sleep.log.cut |> filter(complete.cases(SLEEP) & (EXP_IND.cut == 2)) |> ggplot() + aes(sample = SLEEP) +
+    stat_qq() +
+  ggplot2::stat_qq_line(color = "red", linewidth = 1) +
+    labs(title = "EXP_IND = 2")
+
+sleep.log.cut |> filter(complete.cases(SLEEP) & (EXP_IND.cut == 3)) |> ggplot() + aes(sample = SLEEP) +
+    stat_qq() +
+  ggplot2::stat_qq_line(color = "red", linewidth = 1) +
+    labs(title = "EXP_IND >= 3")
+```
+
+Для всей выборки наблюдаются отклонения на хвостах.
+
+Для группы EXP_IND = 1 точки в целом лежат на одной прямой кроме двух точек на концах.
+
+Для группы EXP_IND $\geq$ 3 наблюдаются очевидные скачки и отклонения от прямой.
+
+#### Lilliefors
+
+Применим критерий Лилиефорса.
+
+```{r}
+lillie.test(sleep.log.cut |> filter(complete.cases(SLEEP)) |> pull(SLEEP))
+lillie.test(sleep.log.cut |> filter(EXP_IND.cut == 1)|> pull(SLEEP))
+lillie.test(sleep.log.cut |> filter(EXP_IND.cut == 2)|> pull(SLEEP))
+lillie.test(sleep.log.cut |> filter(EXP_IND.cut == 3)|> pull(SLEEP))
+```
+
+Критерий отверг гипотезу о нормальности только для EXP_IND $\geq$ 3, как и показывал normal probability plot.
+
+#### AD-test
+
+Применим критерий Андерсона-Дарлинга.
+
+```{r}
+ad.test(sleep.log.cut |> filter(complete.cases(SLEEP)) |> pull(SLEEP))
+ad.test(sleep.log.cut |> filter(EXP_IND.cut == 1)|> pull(SLEEP))
+ad.test(sleep.log.cut |> filter(EXP_IND.cut == 2)|> pull(SLEEP))
+ad.test(sleep.log.cut |> filter(EXP_IND.cut == 3)|> pull(SLEEP))
+```
+
+Также отвергается гипотеза о нормальности для группы EXP_IND $\geq$ 3.
+
+Значение p-value уменьшилось для всей выборки, что объясняется большим количеством точек отклоняющихся от прямой.
+
+#### Shapiro-Wilk
+
+Применим критерий Шапиро-Уилка.
+
+```{r}
+shapiro.test(sleep.log.cut |> filter(complete.cases(SLEEP)) |> pull(SLEEP))
+shapiro.test(sleep.log.cut |> filter(EXP_IND.cut == 1)|> pull(SLEEP))
+shapiro.test(sleep.log.cut |> filter(EXP_IND.cut == 2)|> pull(SLEEP))
+shapiro.test(sleep.log.cut |> filter(EXP_IND.cut == 3)|> pull(SLEEP))
+```
+Также отвергается гипотеза о нормальности для группы EXP_IND $\geq$ 3.
+
+Значение p-value уменьшилось для всей выборки, что объясняется отклонениями на хвостах, которые можно было заметить на normal probability plot.
+
+#### Итог
+
+Итого, сколько раз гипотеза о нормальности отверглась:
+
+Вся выборка: 0/3
+
+EXP_IND == 1: 0/3
+
+EXP_IND == 2: 0/3
+
+EXP_IND $\geq$ 3: 3/3
+
+Для последней группы построим pp-plot для других распределений, например, для лог-нормального и экспоненциального
+
+```{r}
+sleep.log.outl |> filter(complete.cases(SLEEP) & (as.numeric(EXP_IND) >= 3)) |> ggplot() + aes(sample = SLEEP) +
+    stat_pp_point(distribution = "lnorm") +
+  stat_pp_line(color = "steelblue", linewidth = 1) +
+    labs(title = "EXP_IND >= 3, lnorm")
+
+sleep.log.outl |> filter(complete.cases(SLEEP) & (as.numeric(EXP_IND) >= 3)) |> ggplot() + aes(sample = SLEEP) +
+    stat_pp_point(distribution = "exp") +
+  stat_pp_line(color = "steelblue", linewidth = 1) +
+    labs(title = "EXP_IND >= 3, exp")
+```
+
+По графикам нельзя сделать вывода, что эта выборка принадлежнит одному из этих распределений.
+
+### Ящики с усами и гистограммы
+
+Построим ящики с усами для сравнения полученных выборок.
+
+```{r}
+ggplot(sleep.log.outl |> mutate(EXP_IND.cut = as.factor(pmin(3, as.numeric(EXP_IND)))), aes(x=EXP_IND.cut, y=SLEEP)) + 
+    geom_boxplot() +
+    stat_summary(
+        fun = mean, 
+        geom = "point", 
+        shape = 18,
+        size = 3,
+        color = "steelblue",
+        position = position_dodge(0.9)
+    )
+```
+
+Группы EXP_IND = 1 и EXP_IND = 2 имеют похожие средние значения, но разные разбросы. Группа EXP_IND $\geq$ 3 отличается по значению среднего.
+
+```{r eval=FALSE, include=FALSE}
+ggplot(sleep.log.outl |> mutate(EXP_IND.cut = as.factor(pmin(3, as.numeric(EXP_IND)))), aes(x=SLEEP, fill=EXP_IND.cut)) + 
+    geom_histogram(alpha = 0.7, bins = 7, position="dodge") 
+```
+
+### t-критерий
+
+Применим t-критерий сравнения средних.
+
+Критерий точен для нормально распределённых выборок. Хотя он асимптотически точен для не нормальных распределений, маленькие размеры выборок не позволяют использовать его, если мы не уверены в нормальности распределения выборок. Поэтому мы не будем его использовать для группы EXP_IND $\geq$ 3.
+
+Итак, применим t-критерий для сравнения средних для групп EXP_IND = 1 и EXP_IND = 2.
+
+Так как размеры выборок в этих группах не равны (21 и 13), сперва необходимо проверить гипотезу о равенстве дисперсий.
+
+Для этого применим F-тест и критерий Левена (который проверяет ту же гипотезу, в случае нормально распределённых случайных величин).
+
+```{r}
+var.test(SLEEP ~ EXP_IND.cut, data=sleep.log.cut |> filter(as.numeric(EXP_IND.cut) <= 2))
+leveneTest(SLEEP ~ EXP_IND.cut, data=sleep.log.cut |> filter(as.numeric(EXP_IND.cut) <= 2))
+```
+
+Хотя значение p-value для обоих критериев оказывается достаточно большим (не позволяющим отвергнуть гипотезу при уровне значимости 0.1, например), отношение дисперсий оказывается меньше 0.5. Это объясняется маленьким объёмом выборки и, соответственно, маленькой мощностью.
+
+Применим t-критерий в предположении равных диспресий и без этого предположения.
+
+```{r}
+t.test(SLEEP ~ EXP_IND, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(1, 2)), var.equal=T)
+t.test(SLEEP ~ EXP_IND, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(1, 2)), var.equal=F)
+```
+
+Значения p-value очень близки и не позволяют отвергнуть гипотезу равенстве средних.
+
+### Критерий Манна-Уитни
+
+Для группы EXP_IND $\geq$ 3 применим ранговый критерий, критерий Манна-Уитни. Дополнительно применим его для первых двух групп.
+
+```{r}
+wilcox.test(SLEEP ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(1, 2)))
+wilcox.test(SLEEP ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(2, 3)))
+wilcox.test(SLEEP ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(1, 3)))
+```
+
+Для группы EXP_IND $\geq$ 3 отвергается гипотеза о равенстве средних с другими двумя группами. Это соотвтетствует тому, что показывали box-plot'ы.
+
+Для двух ранее рассмотренных групп эта гипотеза не отвергается, как и в прошлом критерии.
+
+### Критерий Колмогорова-Смирнова
+
+Теперь проверим гипотезу о совпадении распределений критерием Колмогорова-Смирнова.
+
+```{r}
+ks.test(SLEEP ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(1, 2)))
+ks.test(SLEEP ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(2, 3)))
+ks.test(SLEEP ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(1, 3)))
+```
+
+Критерий отвергает гипотезу о равенстве распределений группы EXP_IND $\geq$ 3 и двух других. При этом p-value увеличилось, что объясняется тем, что критерий Колмогорова-Смирнова сравнивает распределения в целом и может быть менее "чувствителен" к разнице средних.
+
+Также он не отвергает гипотезу о равенстве распределений первых двух групп.
+
+## BODY_WEIGHT.log
+
+Проведём аналогичное исследование для признака BODY_WEIGHT.log.
+
+Сперва проверим число полных наблюдений по данному признаку по группам.
+
+```{r}
+sleep.log.cut |> filter(complete.cases(BODY_WEIGHT.log, EXP_IND)) |> group_by(EXP_IND.cut) |> summarise(n = n())
+```
+
+Обратим внимание на то, что в группе EXP_IND = 1 и EXP_IND $\geq$ 3 число наблюдений совпало (сбалансированный дизайн).
+
+### Проверка на нормальность
+
+Перед проверками на совпадение распределений, надо проверить выборки на нормальность.
+
+#### Normal probability plot
+
+Построим normal probability plot для всей выборки и по группам.
+
+```{r}
+sleep.log.cut |> filter(complete.cases(BODY_WEIGHT.log)) |> ggplot() + aes(sample = BODY_WEIGHT.log) +
+    stat_qq() +
+  ggplot2::stat_qq_line(color = "red", linewidth = 1) +
+    labs(title = "All sample")
+
+sleep.log.cut |> filter(complete.cases(BODY_WEIGHT.log) & (EXP_IND.cut == 1)) |> ggplot() + aes(sample = BODY_WEIGHT.log) +
+    stat_qq() +
+  ggplot2::stat_qq_line(color = "red", linewidth = 1) +
+    labs(title = "EXP_IND = 1")
+
+sleep.log.cut |> filter(complete.cases(BODY_WEIGHT.log) & (EXP_IND.cut == 2)) |> ggplot() + aes(sample = BODY_WEIGHT.log) +
+    stat_qq() +
+  ggplot2::stat_qq_line(color = "red", linewidth = 1) +
+    labs(title = "EXP_IND = 2")
+
+sleep.log.cut |> filter(complete.cases(BODY_WEIGHT.log) & (EXP_IND.cut == 3)) |> ggplot() + aes(sample = BODY_WEIGHT.log) +
+    stat_qq() +
+  ggplot2::stat_qq_line(color = "red", linewidth = 1) +
+    labs(title = "EXP_IND >= 3")
+```
+
+Для всей выборки точки сильно отклоняются от прямой в центре графика и чуть меньше на хвостах.
+
+Для группы EXP_IND = 2 наблюдаются сильные отклонения на хвостах.
+
+Для группы EXP_IND $\geq$ 3 отклонения наблюдаются скорее в центре графика.
+
+#### Lilliefors
+
+Применим критерий Лилиефорса.
+
+```{r}
+lillie.test(sleep.log.cut |> filter(complete.cases(BODY_WEIGHT.log)) |> pull(BODY_WEIGHT.log))
+lillie.test(sleep.log.cut |> filter(EXP_IND.cut == 1)|> pull(BODY_WEIGHT.log))
+lillie.test(sleep.log.cut |> filter(EXP_IND.cut == 2)|> pull(BODY_WEIGHT.log))
+lillie.test(sleep.log.cut |> filter(EXP_IND.cut == 3)|> pull(BODY_WEIGHT.log))
+```
+
+Критерий даёт малое значение p-value (0.08) для всей выборки и пограничное с 0.1 для групы EXP_IND = 2.
+
+#### AD-test
+
+Применим критерий Андерсона-Дарлинга.
+
+```{r}
+ad.test(sleep.log.cut |> filter(complete.cases(BODY_WEIGHT.log)) |> pull(BODY_WEIGHT.log))
+ad.test(sleep.log.cut |> filter(EXP_IND.cut == 1)|> pull(BODY_WEIGHT.log))
+ad.test(sleep.log.cut |> filter(EXP_IND.cut == 2)|> pull(BODY_WEIGHT.log))
+ad.test(sleep.log.cut |> filter(EXP_IND.cut == 3)|> pull(BODY_WEIGHT.log))
+```
+
+Значение p-value для всей выборки заметно выросло по сравнению с предыдущим критерием. Это может быть связано с тем, что на графике большая часть точек, отклоняющихся от прямой, лежала в середине распределения, в то время как AD-критерий чувствителен к отклонениям на хвостах.
+
+Для группы EXP_IND = 2 значение p-value, наоборот, уменьшилось. Для этой группы наблюдались сильные отклонения на хвостах на Normal probability plot, что может объяснять этот эффект.
+
+#### Shapiro-Wilk
+
+Применим критерий Шапиро-Уилка.
+
+```{r}
+shapiro.test(sleep.log.cut |> filter(complete.cases(BODY_WEIGHT.log)) |> pull(BODY_WEIGHT.log))
+shapiro.test(sleep.log.cut |> filter(EXP_IND.cut == 1)|> pull(BODY_WEIGHT.log))
+shapiro.test(sleep.log.cut |> filter(EXP_IND.cut == 2)|> pull(BODY_WEIGHT.log))
+shapiro.test(sleep.log.cut |> filter(EXP_IND.cut == 3)|> pull(BODY_WEIGHT.log))
+```
+
+Гипотеза о нормальности отверглась только для группы EXP_IND = 2. Точки на графике для этой группы визуально не лежат на одной прямой.
+
+Для других групп отклонения оказаличь не столь значительными. Заметим, что здесь не стоит ориентироваться на изображённую прямую, так как при её построении ,,отсекаются`` хвосты.
+
+#### Итог
+
+Итого, сколько раз гипотеза о нормальности отверглась:
+
+Вся выборка: 1/3 (Лиллиефорс)
+
+EXP_IND == 1: 0/3
+
+EXP_IND == 2: 2/3 (AD и Шапиро-Уилк, Лиллиефорс --- пограничное)
+
+EXP_IND $\geq$ 3: 0/3
+
+### Ящики с усами и гистограммы
+
+Построим ящики с усами для сравнения полученных выборок.
+
+
+
+```{r}
+ggplot(sleep.log.outl |> mutate(EXP_IND.cut = as.factor(pmin(3, as.numeric(EXP_IND)))), aes(x=EXP_IND.cut, y=BODY_WEIGHT.log)) + 
+    geom_boxplot() +
+    stat_summary(
+        fun = mean, 
+        geom = "point", 
+        shape = 18,
+        size = 3,
+        color = "steelblue",
+        position = position_dodge(0.9)
+    )
+```
+
+Группы EXP_IND = 1 и EXP_IND = 2 имеют похожие средние значения, но разные разбросы. Группа EXP_IND $\geq$ 3 отличается по значению среднего.
+
+```{r eval=FALSE, include=FALSE}
+ggplot(sleep.log.outl |> mutate(EXP_IND.cut = as.factor(pmin(3, as.numeric(EXP_IND)))), aes(x=BODY_WEIGHT.log, fill=EXP_IND.cut)) + 
+    geom_histogram(alpha = 0.7, bins = 7, position="dodge") 
+```
+
+### t-критерий
+
+Применим t-критерий сравнения средних.
+
+Так же как и при рассмотрении признака SLEEP, мы не будем применять t-критерий к той группе, где гипотеза о нормальности отверглась, так как размер выборки слишком малы.
+
+Поэтому мы применим t-критерий для сравнения средних для групп EXP_IND = 1 и EXP_IND $\geq$ 3.
+
+Размеры выборок совпадают, нам не нужно проверять гипотезу о равенстве дисперсий перед применением t-критерия. Но мы сделаем это в учебных целях и в целях сравнения распределений в целом (не только средних).
+
+Применим F-тест и критерий Левена.
+
+```{r}
+var.test(BODY_WEIGHT.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(as.numeric(EXP_IND.cut) %in% c(1, 3)))
+leveneTest(BODY_WEIGHT.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(as.numeric(EXP_IND.cut) %in% c(1, 3)))
+```
+
+Гипотеза не отверглась, отношение дисперсий достаточно близко к 1, box-plot'ы похожи по размерам.
+
+Применим t-критерий.
+
+```{r}
+t.test(BODY_WEIGHT.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(1, 3)))
+```
+
+Значение p-value очень мало, гипотеза о равенстве дисперсий отвергается (что соответствует нашим наблюдениям).
+
+### Критерий Манна-Уитни
+
+Для группы EXP_IND = 2 применим ранговый критерий, критерий Манна-Уитни. Дополнительно применим его для первых двух групп
+
+```{r}
+wilcox.test(BODY_WEIGHT.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(1, 2)))
+wilcox.test(BODY_WEIGHT.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(2, 3)))
+wilcox.test(BODY_WEIGHT.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(1, 3)))
+```
+
+Тест Манна-Уитни даёт ожидаемые результаты: для групп EXP_IND = 1 и EXP_IND = 2 нет основания отвергать гипотезу о равенстве средних, а в сравнении с группой EXP_IND $\geq$ 3 гипотеза отвергается
+
+### Критерий Колмогорова-Смирнова
+
+Теперь проверим гипотезу о совпадении распределений критерием Колмогорова-Смирнова.
+
+```{r}
+ks.test(BODY_WEIGHT.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(1, 2)))
+ks.test(BODY_WEIGHT.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(2, 3)))
+ks.test(BODY_WEIGHT.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(1, 3)))
+```
+
+Результат в целом такой же.
+
+Обратим внимание на то, что значение p-value для групп EXP_IND = 1 и EXP_IND = 2 уменьшилось по сравнению с прошлыми критериями. Это может быть связано с тем, что, судя по box-plot'у, группа EXP_IND = 2 имеет меньший разброс.
+
+## LIFESPAN.log
+
+```{r}
+sleep.log.cut |> filter(complete.cases(LIFESPAN.log, EXP_IND.cut)) |> group_by(EXP_IND.cut) |> summarise(n = n())
+```
+
+Нет сбалансированного дизайна.
+
+### Проверка на нормальность
+
+#### Normal probability plot
+
+```{r}
+sleep.log.cut |> filter(complete.cases(LIFESPAN.log)) |> ggplot() + aes(sample = LIFESPAN.log) +
+    stat_qq() +
+  ggplot2::stat_qq_line(color = "red", linewidth = 1) +
+    labs(title = "All sample")
+
+sleep.log.cut |> filter(complete.cases(LIFESPAN.log) & (EXP_IND.cut == 1)) |> ggplot() + aes(sample = LIFESPAN.log) +
+    stat_qq() +
+  ggplot2::stat_qq_line(color = "red", linewidth = 1) +
+    labs(title = "EXP_IND = 1")
+
+sleep.log.cut |> filter(complete.cases(LIFESPAN.log) & (EXP_IND.cut == 2)) |> ggplot() + aes(sample = LIFESPAN.log) +
+    stat_qq() +
+  ggplot2::stat_qq_line(color = "red", linewidth = 1) +
+    labs(title = "EXP_IND = 2")
+
+sleep.log.cut |> filter(complete.cases(LIFESPAN.log) & (EXP_IND.cut == 3)) |> ggplot() + aes(sample = LIFESPAN.log) +
+    stat_qq() +
+  ggplot2::stat_qq_line(color = "red", linewidth = 1) +
+    labs(title = "EXP_IND >= 3")
+```
+
+```{r}
+sleep.log.cut |> filter(complete.cases(LIFESPAN.log) & (EXP_IND.cut == 3)) |> arrange(LIFESPAN.log)
+sleep.log.cut |> filter(complete.cases(LIFESPAN.log) & (EXP_IND.cut == 3)) |> arrange(BODY_WEIGHT.log)
+```
+
+Обратим внимание на два выделяющихся индивида (Chinchilla и Guinea pig) и уберём их из рассмотрения.
+
+```{r}
+sleep.log.cut1 <- sleep.log.cut |> filter(!(NAME %in% c("Chinchilla", "Guinea pig")))
+```
+
+#### Lilliefors
+
+```{r}
+lillie.test(sleep.log.cut1 |> filter(complete.cases(LIFESPAN.log)) |> pull(LIFESPAN.log))
+lillie.test(sleep.log.cut1 |> filter(EXP_IND.cut == 1)|> pull(LIFESPAN.log))
+lillie.test(sleep.log.cut1 |> filter(EXP_IND.cut == 2)|> pull(LIFESPAN.log))
+lillie.test(sleep.log.cut1 |> filter(EXP_IND.cut == 3)|> pull(LIFESPAN.log))
+```
+
+#### AD-test
+
+```{r}
+ad.test(sleep.log.cut1 |> filter(complete.cases(LIFESPAN.log)) |> pull(LIFESPAN.log))
+ad.test(sleep.log.cut1 |> filter(EXP_IND.cut == 1)|> pull(LIFESPAN.log))
+ad.test(sleep.log.cut1 |> filter(EXP_IND.cut == 2)|> pull(LIFESPAN.log))
+ad.test(sleep.log.cut1 |> filter(EXP_IND.cut == 3)|> pull(LIFESPAN.log))
+```
+
+Уменьшилось значение для всей выборки. Это объясняется большим количеством отклоняющихся точек
+
+#### Shapiro-Wilk
+
+```{r}
+shapiro.test(sleep.log.cut1 |> filter(complete.cases(LIFESPAN.log)) |> pull(LIFESPAN.log))
+shapiro.test(sleep.log.cut1 |> filter(EXP_IND.cut == 1)|> pull(LIFESPAN.log))
+shapiro.test(sleep.log.cut1 |> filter(EXP_IND.cut == 2)|> pull(LIFESPAN.log))
+shapiro.test(sleep.log.cut1 |> filter(EXP_IND.cut == 3)|> pull(LIFESPAN.log))
+```
+
+#### Итог
+
+Итого, гипотеза о нормальности не отверглась ни разу.
+
+### Ящики с усами и гистограммы
+
+```{r}
+ggplot(sleep.log.cut1, aes(x=EXP_IND.cut, y=LIFESPAN.log)) + 
+    geom_boxplot() +
+    stat_summary(
+        fun = mean, 
+        geom = "point", 
+        shape = 18,
+        size = 3,
+        color = "steelblue",
+        position = position_dodge(0.9)
+    )
+```
+
+```{r eval=FALSE, include=FALSE}
+ggplot(sleep.log.outl |> mutate(EXP_IND.cut = as.factor(pmin(3, as.numeric(EXP_IND)))), aes(x=LIFESPAN.log, fill=EXP_IND.cut)) + 
+    geom_histogram(alpha = 0.7, bins = 7, position="dodge") 
+```
+
+### t-критерий
+
+В данном случае, так как гипотеза о нормальности не отверглась ни разу, применим t-test ко всем группам.
+
+Так как дизайн не сбалансирован, проверим равенство дисперсий двумя критериями.
+
+F-тест
+
+```{r}
+var.test(LIFESPAN.log ~ EXP_IND.cut, data=sleep.log.cut1 |> filter(as.numeric(EXP_IND.cut) %in% c(1, 2)))
+var.test(LIFESPAN.log ~ EXP_IND.cut, data=sleep.log.cut1 |> filter(as.numeric(EXP_IND.cut) %in% c(1, 3)))
+var.test(LIFESPAN.log ~ EXP_IND.cut, data=sleep.log.cut1 |> filter(as.numeric(EXP_IND.cut) %in% c(2, 3)))
+```
+
+Тест Левена
+
+```{r}
+leveneTest(LIFESPAN.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(as.numeric(EXP_IND.cut) %in% c(1, 2)))
+leveneTest(LIFESPAN.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(as.numeric(EXP_IND.cut) %in% c(1, 3)))
+leveneTest(LIFESPAN.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(as.numeric(EXP_IND.cut) %in% c(2, 3)))
+```
+
+Результат соответствует тому, что показывали ящики с усами: первые две группы имеют близкий разброс (не отвергаем гипотезу), а третья --- сильно меньший (гипотеза отверглась в сравнении с двумя другими).
+
+```{r}
+t.test(LIFESPAN.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(as.numeric(EXP_IND.cut) %in% c(1, 2)), var.equal=T)
+t.test(LIFESPAN.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(as.numeric(EXP_IND.cut) %in% c(1, 3)), var.equal=F)
+t.test(LIFESPAN.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(as.numeric(EXP_IND.cut) %in% c(2, 3)), var.equal=F)
+```
+
+Результаты t-критерия соответствуют ожиданиям.
+
+### Критерий Манна-Уитни
+
+```{r}
+wilcox.test(LIFESPAN.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(1, 2)))
+wilcox.test(LIFESPAN.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(2, 3)))
+wilcox.test(LIFESPAN.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(1, 3)))
+```
+
+Ранговый критерий даёт похожий результат.
+
+### Критерий Колмогорова-Смирнова
+
+```{r}
+ks.test(LIFESPAN.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(1, 2)))
+ks.test(LIFESPAN.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(2, 3)))
+ks.test(LIFESPAN.log ~ EXP_IND.cut, data=sleep.log.cut |> filter(EXP_IND.cut %in% c(1, 3)))
+```
+
+# Об анализе зависимостей
+
+Изучим зависимости между рассматриваемыми признаками. 
+
+В прошлом разделе проверялась гипотеза о равенстве распределений выборок по значениям EXP_IND. Ни одна из гипотез не отверглась для выборок EXP_IND = 1 и EXP_IND = 2, поэтому мы объединим их. Таким образом мы уменьшим количество групп и увеличим объём выборки для каждой группы.
+
+```{r}
+sleep.log.safe <- sleep.log.outl |> filter(EXP_IND %in% c(1,2))
+sleep.log.dang <- sleep.log.outl |> filter(EXP_IND %in% c(3,4,5))
+```
+
+## ,,Безопасный`` сон
+
+Рассмотрим группу индивидов, которые спят ,,в безопасности``.
+
+```{r}
+sleep.log.safe |> datatable(options = list(pageLength = 10,
+                                           scrollX = TRUE))
+```
+
+Обратим внимание на пропуски в данных.
+
+```{r}
+sleep.log.safe |> summarise(across(everything(), ~ sum(is.na(.)))) |> datatable(options = list(pageLength = 10,
+                                                                                               scrollX = TRUE))
+sleep.log.safe |> complete.cases() |> (function(x) !x)() |> sum()
+sleep.log.safe |> filter(!complete.cases(PARADOX)) |> select(NAME, SLOWWAVE, PARADOX, SLEEP, LIFESPAN.log, GESTTIME.log)|> 
+    datatable(options = list(pageLength = 10,
+                             scrollX = TRUE))
+sleep.log.safe |> filter(!complete.cases(LIFESPAN.log, GESTTIME.log)) |> select(NAME, SLOWWAVE, PARADOX, SLEEP, LIFESPAN.log, GESTTIME.log)|>
+    datatable(options = list(pageLength = 10,
+                             scrollX = TRUE))
+```
+
+Пропуски находятся в признаках, относящихся ко сну, и в признаках, относящихся к продолжительности жизни/вынашивания. Причём строки с пропусками оказались непересекающимися, итого около трети индивидов имеют пропуски в данных.
+
+Попробуем добавить ещё один признак: 
+
+PARADOX.REL --- отношение продолжительности фазы медленного сна ко всей продолжительности сна.
+
+```{r}
+sleep.log.safe <- sleep.log.safe |> relocate(SLOWWAVE, PARADOX, SLEEP, .after = GESTTIME.log) |> 
+    mutate(PARADOX.REL = PARADOX / SLEEP, .after = PARADOX)
+```
+
+### Линейные зависимости
+
+Построим pairs-plot и посчитаем коэффициенты корреляции Пирсона. Использовать case-wise удаление пропусков выглядит неразумным, так как сильно уменьшится объём выборки.
+
+Поменяем порядок признаков и поставим рядом признаки, относящиеся к весу и относящиеся к продолжительности жизни и вынашивания, так как кажется, что между признаками в этих группах более выраженная линейная зависимость, чем с признаками, относящимися к продолжительности сна.
+
+```{r message=FALSE, warning=FALSE, fig.width=8, fig.height=8}
+ggpairs(sleep.log.safe |> select(-NAME, -ends_with("_IND")),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("cor")),
+       diag = list(continuous = wrap("barDiag", bins=12)),
+    ) +
+    labs(title =  "Safe sleep")
+```
+
+Сперва обратим внимание на две точки: с самым маленьким и с самым большим значением PARADOX.REL
+
+```{r}
+sleep.log.safe |> slice_min(PARADOX.REL, n=3)|> datatable(options = list(pageLength = 10,
+                                                                         scrollX = TRUE))
+sleep.log.safe |> slice_max(PARADOX.REL, n=3)|> datatable(options = list(pageLength = 10,
+                                                                         scrollX = TRUE))
+```
+
+Уберём этих двух индивидов (Europ. hedgehog и Echidna).
+
+```{r message=FALSE, warning=FALSE, fig.width=8, fig.height=8}
+ggpairs(sleep.log.safe |> filter(!(NAME %in% c("Europ. hedgehog", "Echidna"))) |> select(-NAME, -ends_with("_IND")),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("cor", method="pearson")),
+       diag = list(continuous = wrap("barDiag", bins=10)),
+    ) +
+    labs(title =  "Safe sleep")
+```
+
+Для удобства визуализации построим heatmap корреляционной матрицы.
+
+```{r}
+sleep.log.safe |> filter(!(NAME %in% c("Europ. hedgehog", "Echidna"))) |> select(-NAME, -ends_with("_IND")) |>
+    cor(use = "pairwise.complete.obs") |> 
+    corrplot(method = "color",
+             col = colorRampPalette(c("blue", "white", "red"))(100),
+             tl.col = "black",      # Text label color
+             tl.srt = 45)
+```
+
+Как и было отмечено выше, большая часть значимо коррелируемых пар признаков находится среди пар первых четырёх признаков.
+
+Попробуем интерпретировать значимые зависимости:
+
+* BODY_WEIGHT.log ~ BRAIN_WEIGHT.log.
+
+После логарифмирования, распределения этих признаков стали близки к нормальным, поэтому регрессия этих признаков близка к линейной. Это объясняет вид графика и большое значение коэффициента. 
+
+Сама зависимость объясняется естественным образом: чем больше масса тела животного, тем больше, в целом, масса и всех частей тела, в том числе головы и мозга.
+
+* LIFESPAN.log ~ GESTTIME.log. 
+
+Коэффициент корреляции положительный. Звучит естественно, что, например, при маленькой продолжительности жизни вынашивание не может быть слишком продолжительным.
+
+* BODY_WEIGHT.log ~ LIFESPAN.log: 
+
+Объяснение может быть следующим: большая продолжительность жизни означает большую длительность периода роста организма, а значит, по итогу, большую массу тела.
+
+Так как все три приведённые выше корреляции положительны, то все остальные корреляции в этих группах могут объясняться ими (не объясняя причинно-следственных связей, о чём будет ниже).
+
+Признаки относящиеся ко сну значимо не коррелируют с остальными, кроме пар SLEEP ~ GESTTIME.log и PARADOX ~ GESTTIME.log. На соответствующих графиках (особенно с PARADOX) точки в правом нижнем углу образуют своё небольшое облако, что может объяснять значимый отрицательный коэффициент корреляции. Если это неоднородность, то она не объясняется ни одним из категориальных признаков.
+
+```{r}
+sleep.log.safe |> arrange(desc(GESTTIME.log)) |> datatable(options = list(pageLength = 10,
+                                                                         scrollX = TRUE))
+```
+
+Внитри последней группы признаков наблюдаются следующие зависимости:
+
+* SLEEP значимо положительно коррелирует с SLOWWAVE и PARADOX, что логично, т.к. SLEEP равен сумме этих двух признаков. При этом SLEEP не коррелирует с PARADOX.REL
+
+* Так же можно объяснить корреляцию SLOWWAVE и PARADOX.
+
+* Интересна корреляция PARADOX.REL и PARADOX, при отсутствии корреляции PARADOX.REL и SLOWWAVE.
+
+### Ранговые корреляции
+
+Для начала теоретические предположения:
+
+* Коэффициент корреляции Спирмена примерна равен коэффициенту Пирсона в случае линейных зависимостей (например нормально распределённые выборки). Это скорее всего будет выполняться для BODY_WEIGHT.log и BRAIN_WEIGHT.log.
+
+* Коэффициент Спирмена будет больше коэффициента Пирсона, в случае нелинейной монотонной зависимости. Судя по графикам это может быть для LIFESPAN.log с BODY_WEIGHT.log и BRAIN_WEIGHT.log.
+
+* Коэффициент Спирмена будет меньше коэффициента Пирсона, в случае выбросов (благодаря робастности). Возможно это поможет с необъяснёнными корреляциями GESTTIME.log с SLEEP и PARADOX.
+
+Построим pairs-plot
+
+```{r message=FALSE, warning=FALSE, fig.width=8, fig.height=8}
+ggpairs(sleep.log.safe |> filter(!(NAME %in% c("Europ. hedgehog", "Echidna"))) |> select(-NAME, -ends_with("_IND")),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("cor", method="spearman")),
+       diag = list(continuous = wrap("barDiag", bins=10)),
+    ) +
+    labs(title =  "Safe sleep")
+```
+
+Теоретические предположения оказались верны, за исключением второго, про нелинейные зависимости (Оказались достаточно линейными).
+
+Коэффициент корреляции заметно уменьшился по модулю для GESTTIME.log с PARADOX и SLEEP, вплоть до увеличения p-value с 0.05 до 0.1 для PARADOX.
+
+### Частные корреляции
+
+Разберёмся с корреляциями первых 4 признаков (BODY_WEIGHT.log, BRAIN_WEIGHT.log, LIFESPAN.log, GESTTIME.log).
+
+Построим матрицу частных корреляций и обратим внимание на те пары признаков, для которых корреляция заметно уменьшится.
+
+```{r}
+pcor.result <- pcor(sleep.log.safe |> select(ends_with(".log")) |> filter(complete.cases(across(ends_with(".log")))))
+
+#pcor.result$estimate
+format_pcor(pcor.result, 4)
+pcor.result$p.value
+#pval_to_stars(pcor.result$p.value)
+```
+
+Корреляции с признаком BRAIN_WEIGHT.log изменились незначительно, в то время как все остальные уменьшились и стали незначимыми, а одна из них (LIFESPAN.log и GESTTIME.log) стала значимо отрицательной.
+
+Рассмотрим частные корреляции остальных пар признаков при фиксировании BRAIN_WEIGHT.log.
+
+Корреляция BODY_WEIGHT.log и LIFESPAN.log при фиксированном BRAIN_WEIGHT.log.
+
+```{r}
+pcor.data <- sleep.log.safe |> filter(complete.cases(BODY_WEIGHT.log, LIFESPAN.log, BRAIN_WEIGHT.log))
+resid.body <- resid(lm(BODY_WEIGHT.log ~ BRAIN_WEIGHT.log, data = pcor.data))
+resid.life <- resid(lm(LIFESPAN.log ~ BRAIN_WEIGHT.log, data = pcor.data))
+
+cor.test.result <- cor.test(resid.body, resid.life)
+cor.test.result
+```
+
+Корреляция стала незначимой. 
+
+Попробуем наоборот зафиксировать BODY_WEIGHT.log и рассмотреть корреляцию BRAIN_WEIGHT.log и LIFESPAN.log.
+
+```{r}
+pcor.data <- sleep.log.safe |> filter(complete.cases(BODY_WEIGHT.log, LIFESPAN.log, BRAIN_WEIGHT.log))
+resid.brain <- resid(lm(BRAIN_WEIGHT.log ~ BODY_WEIGHT.log, data = pcor.data))
+resid.life <- resid(lm(LIFESPAN.log ~ BODY_WEIGHT.log, data = pcor.data))
+
+cor.test.result <- cor.test(resid.brain, resid.life)
+cor.test.result
+```
+
+Корреляция осталась значимой положительной.
+
+Корреляция BODY_WEIGHT.log и GESTTIME.log при фиксированном BRAIN_WEIGHT.log.
+
+```{r}
+pcor.data <- sleep.log.safe |> filter(complete.cases(BODY_WEIGHT.log, GESTTIME.log, BRAIN_WEIGHT.log))
+resid.body <- resid(lm(BODY_WEIGHT.log ~ BRAIN_WEIGHT.log, data = pcor.data))
+resid.gest <- resid(lm(GESTTIME.log ~ BRAIN_WEIGHT.log, data = pcor.data))
+
+cor.test.result <- cor.test(resid.body, resid.gest)
+cor.test.result
+```
+
+Корреляция стала незначимой.
+
+Корреляция LIFESPAN.log и GESTTIME.log при фиксированном BRAIN_WEIGHT.log.
+
+```{r}
+pcor.data <- sleep.log.safe |> filter(complete.cases(LIFESPAN.log, GESTTIME.log, BRAIN_WEIGHT.log))
+resid.life <- resid(lm(LIFESPAN.log ~ BRAIN_WEIGHT.log, data = pcor.data))
+resid.gest <- resid(lm(GESTTIME.log ~ BRAIN_WEIGHT.log, data = pcor.data))
+
+cor.test.result <- cor.test(resid.life, resid.gest)
+cor.test.result
+```
+
+Значение p-value достаточно маленькое, при этом коэффициент корреляции стал меньше нуля.
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,305 @@
+---
+title: "PISA Regression"
+author: "Alexander Khramov"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width=8, fig.height=6, fig.dpi=300, dev="svg")
+library(dplyr, tidyr)
+library(learningtower)
+library(ggplot2)
+library(GGally)
+library(glmnet)  # for ridge regression
+library(psych)   # for function tr() to compute trace of a matrix
+library(nortest)
+library(car)
+library(moments)
+library(MASS)
+library(corrplot)
+library(lm.beta)
+library(ellipse)
+library(conflicted)
+library(DT)
+library(patchwork)
+library(caret)
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+
+
+convert_binary_factors <- function(df) {
+  # Find columns that are factors with exactly 2 levels
+  binary_factor_cols <- names(df)[sapply(df, function(col) is.factor(col) && length(levels(col)) == 2)]
+  
+  for (col in binary_factor_cols) {
+    first_level <- levels(df[[col]])[1]
+    new_name <- paste0(col, ".", first_level)
+    
+    # 1 if first level, 0 if second level, preserving NA values
+    df[[new_name]] <- ifelse(is.na(df[[col]]), NA_real_, ifelse(df[[col]] == first_level, 1, 0))
+    
+    # Remove original column
+    df[[col]] <- NULL
+  }
+  
+  return(df)
+}
+
+library(dplyr)
+
+sample_n_students <- function(df, N, 
+                              school_col = "school_id", 
+                              student_col = "student_id", 
+                              year_col = "year") {
+  
+  if (N > nrow(df)) {
+    stop(paste("Requested N (", N, ") is larger than total available rows (", nrow(df), ")."))
+  }
+  
+  # 1. Get unique observations (student-school-year combinations)
+  obs_df <- df |> 
+    distinct(across(all_of(c(school_col, student_col, year_col))))
+  
+  if (N > nrow(obs_df)) {
+    stop(paste("Requested N (", N, ") is larger than unique student-school-year records (", nrow(obs_df), ")."))
+  }
+  
+  # 2. Shuffle randomly upfront
+  obs_shuffled <- obs_df[sample(nrow(obs_df)), ]
+  
+  # 3. Interleave by year AND school so selection cycles evenly across all years and schools
+  selected_obs <- obs_shuffled |> 
+    group_by(across(all_of(c(year_col, school_col)))) |> 
+    mutate(rank_within_group = row_number()) |> 
+    ungroup() |> 
+    # Sorting by rank interleave-samples evenly across combinations
+    arrange(rank_within_group) |> 
+    slice_head(n = N)
+  
+  # 4. Filter original dataset
+  df |> 
+    inner_join(
+      selected_obs |> select(all_of(c(school_col, student_col, year_col))), 
+      by = c(school_col, student_col, year_col)
+    )
+}
+
+decorated_dt <- function(data, digits = 3) {
+  num_cols <- which(sapply(data, is.numeric))
+  names(num_cols) <- NULL
+  
+  datatable(data, 
+            options = list(
+              scrollX = TRUE,
+              columnDefs = 
+                list(list(targets = num_cols,  # JS uses 0-based indexing
+                     render = JS(sprintf(
+                       "function(data, type, row){ 
+                          if (data === null || isNaN(data)) { return 'NA'; }
+                          return data.toFixed(%d); 
+                        }", digits
+                     ))))
+              
+            ))
+}
+
+plot_boxplots <- function(data, cont_var) {
+  # Find discrete (non-numeric) columns, excluding the continuous one
+  disc_vars <- names(data)[sapply(data, is.factor)]
+  disc_vars <- setdiff(disc_vars, cont_var)
+  
+  # Build a plot for each discrete variable
+  plots <- lapply(disc_vars, function(var) {
+      plot_data <- data[!is.na(data[[cont_var]]) & !is.na(data[[var]]), ]
+    ggplot(plot_data, aes(x = .data[[var]], y = .data[[cont_var]])) +
+      geom_boxplot(fill = "steelblue", alpha = 0.7) +
+      labs(x = var, y = cont_var,
+           title = paste(cont_var, "by", var)) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  })
+  
+  # Arrange all plots
+  plots
+}
+```
+
+# Обзор данных, предобработка
+
+```{r}
+load("raw_pisa")
+#raw_pisa <- load_student(year = c(2012, 2015, 2018))
+#save(raw_pisa, file="raw_pisa")
+```
+
+Описание признаков: ?student
+
+
+```{r}
+#raw_pisa |> summary()
+raw_pisa |> names()
+raw_pisa$father_educ |> levels()
+raw_pisa$book |> levels()
+```
+
+```{r}
+pisa <- raw_pisa |> mutate(year = as.factor(year),
+                           father_educ =  factor(father_educ, levels = c("less than ISCED1", "ISCED 1", "ISCED 2", "ISCED 3A", "ISCED 3B, C"), ordered=T),
+                           mother_educ =  factor(mother_educ, levels = c("less than ISCED1", "ISCED 1", "ISCED 2", "ISCED 3A", "ISCED 3B, C"), ordered=T),
+                           book=factor(book, levels=c("0-10", "11-25", "26-100", "101-200", "201-500", "More than 500"), ordered=T))
+rm(raw_pisa)
+```
+
+```{r eval=FALSE, include=FALSE}
+pisa |> summary()
+
+pisa |> nrow()
+pisa |> select(-dishwasher) |> group_by(year) |> summarise(total = n(), complete = sum(complete.cases(pick(everything()))))
+
+pisa |> filter(computer == "yes" & computer_n == 0) |> head(100) |> decorated_dt()
+pisa |> filter(computer == "no" & computer_n != 0) |> head(100) |> decorated_dt()
+
+colSums(!is.na(pisa |> filter(year == "2018")))
+pisa |> filter(year == "2018", is.na(gender)) |> decorated_dt()
+pisa$country |> levels()
+pisa |> group_by(country) |> summarise(total = n()) |> arrange(desc(total)) |> decorated_dt()
+pisa |> filter(country %in% c("RUS", "ARG", "TUN")) |> group_by(country) |> summarise(total = n()) |> arrange(desc(total))
+```
+
+```{r include=FALSE}
+pisa.log <- pisa |> mutate(stu_wgt.log = log(stu_wgt)) |> select(-stu_wgt)
+```
+
+# Регрессия без регуляризации
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+set.seed(42)
+pisa |> filter(country == "FRA") |> select(-dishwasher) |> group_by(year) |> summarise(total = n(), complete = sum(complete.cases(pick(everything()))))
+visualise_data <- pisa.log |> select(-dishwasher) |> filter(country == "FRA", father_educ > "ISCED 1", mother_educ > "ISCED 1") |> filter(complete.cases(pick(everything()))) |> sample_n_students(2000)
+ggpairs(visualise_data |> select(math, read, science, year, escs, wealth, gender, mother_educ),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag")))
+```
+
+```{r}
+plot_boxplots(visualise_data, "read")
+```
+
+```{r}
+pisa.log.regr <- pisa.log |> select(-dishwasher, -stu_wgt.log) |>
+    filter(country == "FRA", father_educ > "ISCED 1", mother_educ > "ISCED 1") |>
+    filter(complete.cases(pick(everything()))) |>
+    mutate(year = as.integer(year),
+           television = as.integer(television),
+           computer_n = as.integer(computer_n),
+           car = as.integer(car),
+           book = as.integer(book),
+           mother_educ = factor(mother_educ, ordered=F),
+           father_educ = factor(father_educ, ordered=F))
+set.seed(42)
+idx <- sample(nrow(pisa.log.regr), 0.7 * nrow(pisa.log.regr))
+pisa.log.train <- pisa.log.regr[idx, ]
+pisa.log.test  <- pisa.log.regr[-idx, ]
+```
+
+```{r}
+model.full <- lm(read ~ .,
+                 pisa.log.train |> select(-country, - school_id, - student_id)) # , -math, -science
+model.full |> lm.beta() |> summary()
+```
+
+```{r}
+# backward даёт year + father_educ + gender + computer + internet + math + science + desk + car + book + wealth + escs
+
+step.backward <- stepAIC(model.full, scope=list(upper = ~ ., lower = ~1), 
+                    trace=F, direction="backward")
+step.backward |> lm.beta() |> summary()
+
+cor(pisa.log.test$read, predict(step.backward, pisa.log.test))^2
+```
+
+## попробуем не брать math и science
+
+```{r}
+model.full <- lm(read ~ .,
+                 pisa.log.train |> select(-country, - school_id, - student_id, -math, -science))
+model.full |> lm.beta() |> summary()
+```
+
+```{r}
+# backward даёт year + gender + internet + math + science + computer_n + book + wealth
+step.backward <- stepAIC(model.full, scope=list(upper = ~ ., lower = ~1), 
+                    trace=T, direction="backward")
+step.backward |> lm.beta() |> summary()
+
+cor(pisa.log.test$read, predict(step.backward, pisa.log.test))^2
+```
+
+# Регрессия с регуляризацией
+
+## $L^2$-регуляризация
+
+```{r}
+y <- pisa.log.train |> na.omit() |> model.matrix(~ read - 1, data=_) |> scale(center = TRUE, scale = FALSE)
+X <- pisa.log.train |> na.omit() |> model.matrix(~ . -country -student_id -school_id -read - 1, data=_) 
+```
+```{r}
+# Perform 10-fold cross-validation to select lambda ---------------------------
+lambdas_to_try <- 10^seq(-3, 1, length.out = 150)
+# Setting alpha = 0 implements ridge regression
+ridge_cv <- cv.glmnet(X, y, alpha = 0, lambda = lambdas_to_try,
+                      standardize = TRUE, nfolds = 20)
+# Plot cross-validation results
+plot(ridge_cv)
+
+lambda_cv <- ridge_cv$lambda.min
+lambda_cv
+# Fit final model, get its sum of squared residuals and multiple R-squared
+model_ridge_cv <- glmnet(X, y, alpha = 0, lambda = lambda_cv, standardize = TRUE)
+
+cor(pisa.log.test$read, predict(model_ridge_cv, pisa.log.test|> model.matrix(~ . -country -student_id -school_id -read - 1, data=_) ))^2
+```
+
+```{r}
+res <- glmnet(X, y, alpha = 0, lambda = lambdas_to_try, standardize = FALSE)
+plot(res, xvar = "lambda")
+legend("bottomright", lwd = 1, col = 1:29, legend = colnames(X), cex = .7)
+```
+
+## $L^1$-регуляризация (LASSO)
+
+```{r}
+# Perform 10-fold cross-validation to select lambda ---------------------------
+#lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+# Setting alpha = 1 implements lasso regression
+lasso_cv <- cv.glmnet(X, y, alpha = 1, lambda = lambdas_to_try,
+                      standardize = TRUE, nfolds = 10)
+# Plot cross-validation results
+plot(lasso_cv)
+
+lambda_cv_min <- lasso_cv$lambda.min
+lambda_cv_1se <- lasso_cv$lambda.1se
+# Fit final model, get its sum of squared residuals and multiple R-squared
+model_cv_lasso <- glmnet(X, y, alpha = 1, lambda = lambda_cv_min, standardize = TRUE)
+model_cv_lasso |> coef()
+
+cor(pisa.log.test$read, predict(model_cv_lasso, pisa.log.test|> model.matrix(~ . -country -student_id -school_id -read - 1, data=_) ))^2
+
+model_cv_lasso <- glmnet(X, y, alpha = 1, lambda = lambda_cv_1se, standardize = TRUE)
+model_cv_lasso |> coef()
+
+cor(pisa.log.test$read, predict(model_cv_lasso, pisa.log.test|> model.matrix(~ . -country -student_id -school_id -read - 1, data=_) ))^2
+```
+Итого отбор признаков в обычной регрессии:
+
+year + gender + internet + math + science + computer_n + book + wealth
+
+(0.7302)
+
+Отбор при помощи LASSO:
+
+year + mother_educ + gender + internet + math + science + computer_n + car + book
+
+(0.7293)

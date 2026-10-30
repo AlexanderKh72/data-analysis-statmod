@@ -1,0 +1,260 @@
+---
+title: "Spotify"
+author: "Alexander Khramov"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, warning = T, message = T, fig.align = 'center', fig.width=8, fig.height=6, fig.dpi=200, dev="svg")
+```
+
+```{r load_data, include=FALSE}
+library(dplyr, tidyr)
+library(learningtower)
+library(ggplot2)
+library(GGally)
+library(glmnet)  # for ridge regression
+library(psych)   # for function tr() to compute trace of a matrix
+library(nortest)
+library(car)
+library(moments)
+library(MASS)
+library(corrplot)
+library(lm.beta)
+library(ellipse)
+library(conflicted)
+library(DT)
+library(patchwork)
+library(caret)
+library(readxl)
+library(FactoMineR)
+library(factoextra)
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+
+decorated_dt <- function(data, digits = 3) {
+  num_cols <- which(sapply(data, is.numeric))
+  names(num_cols) <- NULL
+  
+  datatable(data, 
+            options = list(
+              scrollX = TRUE,
+              columnDefs = 
+                list(list(targets = num_cols,  # JS uses 0-based indexing
+                          render = JS(sprintf(
+                            "function(data, type, row){  
+                               if (data === null || isNaN(data)) { return 'NA'; }
+                               if (Number.isInteger(data)) {
+                                   return data;
+                               }
+                               return data.toFixed(%d);  
+                            }", digits
+                          ))))
+              
+            ))
+}
+
+sample_balanced_groups <- function(df, N, cols) {
+  # 1. Validation checks
+  if (N > nrow(df)) {
+    stop(paste("Requested N (", N, ") is larger than total available rows (", nrow(df), ")."))
+  }
+  
+  if (length(cols) == 0) {
+    stop("The 'cols' character vector cannot be empty.")
+  }
+  
+  # 2. Group by the specified columns, shuffle rows within each group, and assign ranks
+  ranked_df <- df |> 
+    group_by(across(all_of(cols))) |> 
+    slice_sample(prop = 1) |>        # Randomly shuffle rows within each group
+    mutate(rank_in_group = row_number()) |> 
+    ungroup()
+  
+  # 3. Sort by rank to interleave selections evenly across all groups, then slice top N
+  selected_df <- ranked_df |> 
+    arrange(rank_in_group) |> 
+    slice_head(n = N) |>
+      select(-rank_in_group)
+  
+  return(selected_df)
+}
+
+raw.spotify <- read.csv("dataset.csv")
+raw.spotify <- raw.spotify |>
+    mutate(track_genre = as.factor(track_genre),
+           mode = factor(mode, levels=c(0,1), labels=c("minor", "major")),
+           explicit = (explicit == "True"))
+```
+
+```{r}
+raw.spotify |> head(5) |> decorated_dt()
+raw.spotify |> nrow()
+raw.spotify |> complete.cases() |> sum()
+raw.spotify |> summary()
+raw.spotify$track_genre |> levels()
+```
+
+#### Описание признаков
+
+track_id: The Spotify ID for the track
+
+artists: The artists' names who performed the track. If there is more than one artist, they are separated by a ;
+
+album_name: The album name in which the track appears
+
+track_name: Name of the track
+
+popularity: The popularity of a track is a value between 0 and 100, with 100 being the most popular. The popularity is calculated by algorithm and is based, in the most part, on the total number of plays the track has had and how recent those plays are. Generally speaking, songs that are being played a lot now will have a higher popularity than songs that were played a lot in the past. Duplicate tracks (e.g. the same track from a single and an album) are rated independently. Artist and album popularity is derived mathematically from track popularity.
+duration_ms: The track length in milliseconds
+
+explicit: Whether or not the track has explicit lyrics (true = yes it does; false = no it does not OR unknown)
+
+danceability: Danceability describes how suitable a track is for dancing based on a combination of musical elements including tempo, rhythm stability, beat strength, and overall regularity. A value of 0.0 is least danceable and 1.0 is most danceable
+
+energy: Energy is a measure from 0.0 to 1.0 and represents a perceptual measure of intensity and activity. Typically, energetic tracks feel fast, loud, and noisy. For example, death metal has high energy, while a Bach prelude scores low on the scale
+
+key: The key the track is in. Integers map to pitches using standard Pitch Class notation. E.g. 0 = C, 1 = C♯/D♭, 2 = D, and so on. If no key was detected, the value is -1
+
+loudness: The overall loudness of a track in decibels (dB)
+
+mode: Mode indicates the modality (major or minor) of a track, the type of scale from which its melodic content is derived. Major is represented by 1 and minor is 0
+
+speechiness: Speechiness detects the presence of spoken words in a track. The more exclusively speech-like the recording (e.g. talk show, audio book, poetry), the closer to 1.0 the attribute value. Values above 0.66 describe tracks that are probably made entirely of spoken words. Values between 0.33 and 0.66 describe tracks that may contain both music and speech, either in sections or layered, including such cases as rap music. Values below 0.33 most likely represent music and other non-speech-like tracks
+
+acousticness: A confidence measure from 0.0 to 1.0 of whether the track is acoustic. 1.0 represents high confidence the track is acoustic
+
+instrumentalness: Predicts whether a track contains no vocals. "Ooh" and "aah" sounds are treated as instrumental in this context. Rap or spoken word tracks are clearly "vocal". The closer the instrumentalness value is to 1.0, the greater likelihood the track contains no vocal content
+
+liveness: Detects the presence of an audience in the recording. Higher liveness values represent an increased probability that the track was performed live. A value above 0.8 provides strong likelihood that the track is live
+
+valence: A measure from 0.0 to 1.0 describing the musical positiveness conveyed by a track. Tracks with high valence sound more positive (e.g. happy, cheerful, euphoric), while tracks with low valence sound more negative (e.g. sad, depressed, angry)
+
+tempo: The overall estimated tempo of a track in beats per minute (BPM). In musical terminology, tempo is the speed or pace of a given piece and derives directly from the average beat duration
+
+time_signature: An estimated time signature. The time signature (meter) is a notational convention to specify how many beats are in each bar (or measure). The time signature ranges from 3 to 7 indicating time signatures of 3/4, to 7/4.
+
+track_genre: The genre in which the track belongs
+
+## Поп
+
+```{r message=F, warning=F}
+set.seed(42)
+ggpairs(raw.spotify |> filter(track_genre == "pop") |> 
+            select(where(is.numeric)) |> mutate(key = as.factor(key)) |> select(-X, -time_signature),
+       lower = list(continuous = "points"), 
+       upper = list(continuous = "points"),       
+       diag = list(continuous = wrap("barDiag", bins = 15))
+        )
+```
+
+```{r}
+cols.pop <- c("duration_ms", 
+          "speechiness", 
+          "acousticness", 
+          #"instrumentalness", 
+          "liveness")
+
+# instrumentalness --- ненельзя трактовать как непрерывный признак, так как много нулевых значений
+raw.spotify |> 
+  filter(track_genre == "pop", instrumentalness <= 0) |> nrow()
+#raw.spotify |> 
+#  filter(track_genre == "pop", if_any(all_of(cols.pop), ~ . <= 0)) |> select(all_of(cols.pop))
+
+spotify.pop <- raw.spotify |> 
+  mutate(across(all_of(cols.pop), log, .names = "{col}.log")) |> 
+  select(-all_of(cols.pop))
+```
+
+```{r message=F, warning=F}
+ggpairs(spotify.pop |> filter(track_genre == "pop") |> 
+            select(where(is.numeric)) |> select(-X, -instrumentalness, -key, -time_signature),
+       lower = list(continuous = "points"), 
+       upper = list(continuous = "points"),       
+       diag = list(continuous = wrap("barDiag", bins = 15))
+        )
+```
+
+Наиболее важные параметры функции PCA:
+
+* scale.unit = TRUE (по умолчанию): надо ли провести стандартизацию, т.е. TRUE --- АГК по корреляционной матрице, FALSE --- АГК по ковариационной матрице.
+* ncp = length(active.cols.pop): число главных компонент, которые будут доступны в результате. По умолчанию оставляется только 5, но так как здесь признаков не так много, можно оставить все.
+* ind.sup, quanti.sup, quali.sup: дополнительные индивиды, количественные и качественные признаки, которые не учитываются в АГК, но можно добавить на графики (не используем)
+* row.w, col.w: веса соответственно индивидов и признаков. Причём для индивидов (если я правильно понял) веса всегда приводятся к вероятностной мере, т.е. нормируются, чтобы сумма равнялась 1. По умолчанию: веса 1 для всех признаков, и равномерные веса ($1/n$) для индивидов.
+
+```{r}
+active.cols.pop <- spotify.pop |> 
+            select(where(is.numeric))|>
+                select(-X, -key, -time_signature, -instrumentalness) |> colnames()
+active.cols.pop
+active.spotify.pop <- spotify.pop |> filter(track_genre == "pop")
+res.pca.pop <- PCA(active.spotify.pop |> 
+            select(all_of(active.cols.pop)), graph = F, ncp=length(active.cols.pop))
+```
+
+```{r}
+get_eigenvalue(res.pca.pop)
+fviz_eig(res.pca.pop, addlabels = TRUE)
+```
+
+Значение собственных чисел ($\lambda_i$) падает и не выходит на постоянный уровень, чтобы можно было таким образом определить шумовые компоненты. 
+
+Выведем сингулярные векторы $U_i$. Получим их из факторных нагрузок $F_i = \sqrt{\lambda_i} U_{i}$ делением на соответствующее сингулярное значение. По ним можно будет интерпретировать главные компоненты (т.е. какие изначальные признаки с какими коэффициентами составляют эту компоненту). Ту же таблицу можно изобразить цветами для наглядности.
+
+```{r}
+res.pca.var <- get_pca_var(res.pca.pop)
+#res.pca.var$coord^2 |> rowSums()
+t(t(res.pca.var$coord) / sqrt(get_eigenvalue(res.pca.pop)[,"eigenvalue"]))
+t(t(res.pca.var$coord) / sqrt(get_eigenvalue(res.pca.pop)[,"eigenvalue"])) |> corrplot(col = rev(COL2('RdBu')))
+```
+
+Первая главная компонента ($Z_1 = \mathbb{X} U_1$) --- общая "драйвовость" трека (высокое значение -- у весёлых и энергичных, низкое -- у грустных акустических)
+
+```{r}
+fviz_pca_var(res.pca.pop, repel=TRUE, col.var = "black")
+```
+
+График координат признаков $(f_{i,1}, f_{i,2})$ в базисе $V_j$ (нормированные главные компоненты). Так как АГК выполнен по корреляционной матрице, эти же значения равны корреляции новых и старых признаков. 
+
+Лучше всего описываются громкость и энергичность музыки (сильно коррелированные), но остальные признаки описаны плохо. Популярность не описывается первой компонентой и только немного описывается второй.
+
+```{r}
+fviz_pca_biplot(res.pca.pop,
+                geom.ind = "point",
+                col.var = "black",   # variables
+                col.ind = "cos2",
+                gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"))   # individuals
+```
+
+Индивиды --- точки с координатами $(z_{i,1}, z_{i,2})$. Покрашены в соответствии со значением квадрата косинуса угла между ними и плоскостью первых двух новых признаков. Индивиды с значениями близкими к 0 расположены ближе к центру, с высокими значениями --- дальше от центра, выбивающихся индивидов не обнаружено.
+
+Стрелками изображены координаты признаков $(f_{i,1}, f_{i,2})$, как и на прошлом рисунке, но с коэффициентом (для наглядности).
+
+```{r}
+res.pca.ind <- get_pca_ind(res.pca.pop)
+raw.spotify[
+    active.spotify.pop[
+    c(res.pca.ind$coord[,1] |> which.max(),
+      res.pca.ind$coord[,1] |> which.min()),1] + 1,
+    ] |> decorated_dt()
+```
+
+Два трека с наибольшим и наименьшим значением первой компоненты. Первый --- бодрая индийская песня, второй --- тихая мелодичная песня.
+
+```{r}
+res.pca.ind <- get_pca_ind(res.pca.pop)
+raw.spotify[
+    active.spotify.pop[
+    c(res.pca.ind$coord[,2] |> which.max(),
+      res.pca.ind$coord[,2] |> which.min()),1] + 1,
+    ] |> decorated_dt()
+```
+
+
+
+
+
+
+
+

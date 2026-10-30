@@ -1,0 +1,96 @@
+
+## Панк
+
+(в целом, никаких новых эффектов, пояснений тут меньше)
+
+```{r}
+raw.spotify |> filter(track_genre == "punk") |> head(10) |> decorated_dt()
+```
+
+```{r message=F, warning=F}
+set.seed(42)
+ggpairs(raw.spotify |> filter(track_genre == "punk") |> 
+            select(where(is.numeric)) |> select(-X),
+       lower = list(continuous = "points"), 
+       upper = list(continuous = "points"),       
+       diag = list(continuous = wrap("barDiag", bins = 15))
+        )
+```
+
+```{r}
+cols.punk <- c(#"popularity",
+          #"duration_ms", 
+          #"energy",
+          "speechiness", 
+          "acousticness", 
+          #"instrumentalness", 
+          "liveness")
+raw.spotify |> 
+  filter(track_genre == "classical", if_any(all_of(cols.punk), ~ . <= 1e-6)) |> select(all_of(cols.punk))
+
+spotify.punk <- raw.spotify |> 
+  mutate(across(all_of(cols.punk), log, .names = "{col}.log")) |> 
+    mutate(calmness.log = log(1 - energy)) |>
+  select(-all_of(cols.punk), -energy)
+```
+
+```{r message=F, warning=F}
+ggpairs(spotify.punk |> filter(track_genre == "punk") |> 
+            select(where(is.numeric)) |> select(-X),
+       lower = list(continuous = "points"), 
+       upper = list(continuous = "points"),       
+       diag = list(continuous = wrap("barDiag", bins = 15))
+        )
+```
+
+```{r}
+active.cols.punk <- spotify.punk |> 
+            select(where(is.numeric))|>
+                select(-X, -key, -time_signature, -instrumentalness) |> colnames()
+active.spotify.punk <- spotify.punk |> filter(track_genre == "punk")
+res.pca.punk <- PCA(active.spotify.punk |> 
+            select(all_of(active.cols.punk)), graph = FALSE, ncp=10)
+```
+
+```{r}
+get_eigenvalue(res.pca.punk)
+fviz_eig(res.pca.punk, addlabels = TRUE)
+```
+
+Такая же ситуация с собственными числами, как и в поп-музыке
+
+```{r}
+res.pca.var <- get_pca_var(res.pca.punk)
+t(t(res.pca.var$coord) / sqrt(get_eigenvalue(res.pca.punk)[,"eigenvalue"]))
+t(t(res.pca.var$coord) / sqrt(get_eigenvalue(res.pca.punk)[,"eigenvalue"])) |> corrplot(col = rev(COL2('RdBu')))
+```
+
+Первая главная компонента --- примерно такая же как и для поп-музыки, "драйвовость", но только с противоположным знаком.
+
+
+```{r}
+fviz_pca_var(res.pca.punk, col.var = "black")
+```
+
+```{r}
+fviz_pca_biplot(res.pca.punk,
+                geom.ind = "point",
+                col.var = "black",   # variables
+                col.ind = "cos2",
+                gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"))   # individuals
+```
+
+```{r}
+res.pca.ind <- get_pca_ind(res.pca.punk)
+raw.spotify[
+    active.spotify.punk[
+    c(res.pca.ind$coord[,2] |> which.max(),
+      res.pca.ind$coord[,2] |> which.min()),1] + 1,
+    ] |> decorated_dt()
+
+raw.spotify[
+    active.spotify.punk[
+    c(res.pca.ind$coord[,1] |> which.max(),
+      res.pca.ind$coord[,1] |> which.min()),1] + 1,
+    ] |> decorated_dt()
+```

@@ -1,0 +1,701 @@
+---
+title: "Зверюшки. Регрессия"
+author: "Alexander Khramov"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width=8, fig.height=6, fig.dpi=300, dev="svg")
+library(DT)
+library(readxl)
+library(ggplot2)
+library(GGally)
+library(ppcor)
+library(dplyr)
+library(tidyr)
+library(nortest)
+library(car)
+library(moments)
+library(qqplotr)
+library(corrplot)
+library(lm.beta)
+library(ellipse)
+load("data_processed")
+
+redundancy_summary <- function(model, data) {
+  # Get variable names
+  vars <- names(coef(model))[-1]  # Remove intercept
+  
+  # VIF and tolerance
+  vif_vals <- vif(model)
+  if (is.matrix(vif_vals)) {
+    # For models with factors
+    vif_df <- data.frame(
+      Variable = rownames(vif_vals),
+      #VIF = vif_vals[, 1],
+      Tolerance = 1 / vif_vals[, 1]
+    )
+  } else {
+    vif_df <- data.frame(
+      Variable = names(vif_vals),
+      #VIF = vif_vals,
+      Tolerance = 1 / vif_vals
+    )
+  }
+  
+  # Partial correlations with response
+  response_var <- as.character(formula(model))[2]
+  
+  # Select only numeric columns for partial correlations
+  numeric_data <- data[, sapply(data, is.numeric)]
+  
+  # Calculate partial correlations
+  pcor_result <- pcor(numeric_data)
+  
+  # Extract partial correlations with response
+  partial_cors <- data.frame(
+    Variable = vars,
+    Partial_Cor = pcor_result$estimate[vars, response_var]
+  )
+  
+  # Combine results
+  result <- merge(vif_df, partial_cors, by = "Variable")
+  
+  return(result[order(-result$Partial_Cor), ])
+}
+
+partial_eta_sq <- function(model) {
+  # Get ANOVA table (type III)
+  anova_table <- Anova(model, type = "III")
+  
+  # Extract SS for each term
+  ss_effect <- anova_table$`Sum Sq`[!(rownames(anova_table) %in% c("Residuals", "(Intercept)"))]
+  ss_error <- anova_table$`Sum Sq`[rownames(anova_table) == "Residuals"]
+  
+  # Calculate partial η²
+  eta_sq <- ss_effect / (ss_effect + ss_error)
+  
+  # Create result table
+  names(eta_sq) <- rownames(anova_table)[!(rownames(anova_table) %in% c("Residuals", "(Intercept)"))]
+
+  # Sort by value
+  eta_sq
+}
+
+decorated_dt <- function(data, digits = 3) {
+  num_cols <- which(sapply(data, is.numeric))
+  names(num_cols) <- NULL
+  
+  datatable(data, 
+            options = list(
+              scrollX = TRUE,
+              columnDefs = 
+                list(list(targets = num_cols,  # JS uses 0-based indexing
+                     render = JS(sprintf(
+                       "function(data, type, row){ 
+                          if (data === null || isNaN(data)) { return 'NA'; }
+                          return data.toFixed(%d); 
+                        }", digits
+                     ))))
+              
+            ))
+}
+```
+
+# Предварительная обработка
+
+```{r}
+sleep |> decorated_dt()
+```
+
+NAME --- название вида;
+
+BODY_WEIGHT --- масса тела в кг;
+
+BRAIN_WEIGHT --- масса мозга в граммах;
+
+SLOWWAVE --- продолжительность фазы медленного сна (сны не снятся) (часы/день);
+
+PARADOX --- продолжительность фазы быстрого сна (сны снятся) (часы/день);
+
+SLEEP --- общая продолжительность сна (часы/день), равна сумме SLOWWAVE и PARADOX;
+
+LIFESPAN --- наибольшая продолжительность жизни (в годах);
+
+GESTTIME --- продолжительность беременности (в днях);
+
+PRED_IND --- индекс шанса стать жертвой ("индекс хищничества"), где 1 --- наименьшая вероятность стать жертвой хищника, 5 --- наибольшая;
+
+EXP_IND --- индекс воздействия на сон, где 1 --- наименьшее воздействие на сон (защищённое место для сна), 2 --- наибольшее;
+
+DANG_IND --- общий индекс опасности, складывается из прошлых двух и другой информации, где 1 --- наименьшая опасность (от других животных), 5 --- наибольшая.
+
+Полных наблюдений 42 (около двух третей). Больше всего пропущенных значений в признаках SLOWWAVE и PARADOX (14 и 12 соответственно), причём пропуск значения в PARADOX означает пропуск значения в SLOWWAVE.
+
+```{r}
+sleep |> summary()
+```
+
+## Типы признаков
+
+Категориальная переменная (выполняющая функция индексирующей): NAME.
+
+К категориальным/порядковым относятся последние три признака: PRED_IND, EXP_IND, DANG_IND.
+
+Остальные относятся к количественным, предположительно непрерывным. Для проверки посчитаем для них частоту моды и количество уникальных значений.
+
+```{r}
+sleep |> select(-NAME, -(9:11)) |> summarise(across(everything(), list(mode.freq = function(x) max(table(x)))))
+sleep |> select(-NAME, -(9:11)) |> summarise(across(everything(), n_distinct))
+sleep |> select(-NAME, -(9:11)) |> summarise(across(everything(), function(x) n_distinct(x) / sum(!is.na(x))))
+```
+
+Для каждой переменной мода повторяется не более 3 раз и число уникальных значений близко к количеству наблюдений. Далее мы будем считать эти переменные непрерывными.
+
+### Пропущенные значения
+
+Проверим количество пропущенных значений по каждому признаку и количество полных наблюдений.
+
+```{r}
+sleep |> summarise(across(everything(), ~ sum(is.na(.))))
+sleep |> complete.cases() |> sum()
+(!complete.cases(sleep$SLOWWAVE) & !complete.cases(sleep$PARADOX)) |> sum()
+(complete.cases(sleep$SLOWWAVE) & !complete.cases(sleep$PARADOX)) |> sum()
+```
+
+Полных наблюдений 42 (около двух третей). Больше всего пропущенных значений в признаках SLOWWAVE и PARADOX (14 и 12 соответственно), причём пропуск значения в PARADOX означает пропуск значения в SLOWWAVE.
+
+```{r}
+sleep |> select(NAME, SLOWWAVE, PARADOX, SLEEP) |> filter(!complete.cases(PARADOX, SLEEP))
+```
+
+Дополнительно проверим выполнение свойства SLOWWAVE + PARADOX = SLEEP
+
+```{r}
+sleep |> filter(complete.cases(SLOWWAVE, PARADOX, SLEEP)) |> filter(abs(SLOWWAVE + PARADOX - SLEEP) > 0.01)
+```
+
+### Простейшие статистики
+
+```{r}
+head(sleep)
+sleep |> summary()
+```
+
+Среди минимум и максимумов нет явно некорректных значений. 
+
+Для признаков BODY_WEIGHT и BRAIN_WEIGHT, а также LIFESPAN и GESTTIME значение медианы и среднего резко отличается, что может говорить о несимметричности распределений.
+
+## Визуализация изначальных данных
+
+```{r message=F, warning=F}
+ggpairs(sleep |> select(-NAME),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=12)),
+    ) 
+```
+
+Ранее отмеченные признаки BODY_WEIGHT, BRAIN_WEIGHT, LIFESPAN и GESTTIME действительно имеют распределения с хвостом вправо.
+
+Обратим внимание на признак BODY_WEIGHT. Построем квантили для этого признака.
+
+```{r message=FALSE, warning=FALSE}
+mean(sleep$BODY_WEIGHT)
+quantile(sleep$BODY_WEIGHT, probs = seq(0, 1, 0.1))
+```
+
+Среднее значение близко к 0.9-квантили, что говорит о тяжёлом хвосте справа.
+
+Прежде чем продолжить визуальный анализ попробуем прологарифмировать эти признаки.
+
+```{r, eval=FALSE}
+sleep.log <- sleep |> mutate(across(c(BODY_WEIGHT, BRAIN_WEIGHT, LIFESPAN, GESTTIME), log)) |>
+    rename_with(~ paste0(., ".log"), c(BODY_WEIGHT, BRAIN_WEIGHT, LIFESPAN, GESTTIME))
+```
+
+```{r}
+summary(sleep.log)
+```
+
+После логарифмирования среднее значения и медиана признаков стали близки.
+
+## Визуализация логарифмированных данных
+
+```{r message=F, warning=F}
+ggpairs(sleep.log |> select(-NAME),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=12)),
+    ) 
+```
+
+После логорифмирования распределения действительно стали более похожи на нормальные.
+
+## Выбросы
+
+На графиках видны 3 индивида с наибольшим значением PARADOX;
+
+Выделяющаяся группа из индивидов с наибольшим значением PARADOX: водяной и северно-американскоий опоссумы (Water opossum, N. Amer. opossum) и гигантский броненосец (Giant armadillo).
+
+```{r, eval=FALSE}
+sleep.log.outl <- sleep.log |> filter(!(NAME %in% outliers.log.NAME))
+```
+
+```{r message=F, warning=F}
+ggpairs(sleep.log |> filter(!(NAME %in% c("Water opossum", "N. Amer. opossum", "Giant armadillo"))) |> select(-NAME),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=12)),
+    ) 
+```
+
+На нескольких графиках (напр., BRAIN_WEIGHT-LIFESPAN) видны два выброса. Попробуем их определить.
+
+```{r}
+sleep.log |> slice_max(LIFESPAN.log - BRAIN_WEIGHT.log, n=5)
+```
+
+Ими оказались Little brown bat и Big brown bat.
+
+```{r}
+sleep |> slice_max(SLEEP, n=7)
+```
+
+```{r}
+sleep |> filter(endsWith(NAME, "bat"))
+```
+
+Они же оказались самыми спящими животными, вместе с ещё тремя видами, определёнными как выбросы.
+
+```{r message=F, warning=F, eval=FALSE}
+outliers.log.NAME <- c("Water opossum", "Giant armadillo", "N. Amer. opossum", "Little brown bat", "Big brown bat")  #  "African elephant", "Asian elephant", "Man", 
+sleep.log.outl <- sleep.log |> filter(!(NAME %in% outliers.log.NAME))
+```
+```{r message=F, warning=F}
+ggpairs(sleep.log |> filter(!(NAME %in% outliers.log.NAME)) |> select(-NAME),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=12)),
+    )
+```
+
+# Готовые данные
+
+```{r message=F, warning=F}
+ggpairs(sleep.log |> select(-NAME),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=12)),
+    ) 
+```
+
+```{r}
+sleep.log.outl |> summary()
+```
+
+```{r, warning=F, message=F}
+ggpairs(sleep.log |> filter(complete.cases(sleep.log)) |> select(-NAME),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=12)),
+    ) 
+```
+
+```{r}
+sleep |> filter(!complete.cases(LIFESPAN)) |> datatable(options = list(scrollX = TRUE))
+```
+
+Американский суслик, эфиопский ёж, землекоп, аплодонтия --- не указаны данные о продолжительности жизни (её регрессию мы будем строить). На них проверим предсказания полученной (наилучшей) модели
+
+# Регрессия
+
+## Предварительная обработка
+
+Точно нельзя оставлять вместе признаки PARADOX, SLOWWAVE и SLEEP. Оставим SLEEP и новый признак равный PARADOX/SLEEP.
+
+```{r}
+sleep.reg <- sleep.log |>
+    filter(complete.cases(LIFESPAN.log)) |>
+    mutate(PARADOX.REL = PARADOX/SLEEP, .after=PARADOX) |> select(-SLOWWAVE, -PARADOX)
+
+sleep.reg.outl <- sleep.reg |> filter(!(NAME %in% outliers.log.NAME))
+
+sleep.reg.outl |> summary()
+sleep.reg.outl |> complete.cases() |> sum()
+```
+
+Посмотрим pairs-plot с новым признаком.
+
+```{r, warning=F, message=F}
+ggpairs(sleep.reg.outl |> filter(complete.cases(sleep.reg.outl)) |> select(-NAME),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=12)),
+    ) 
+```
+
+Попробуем прологарифмировать новый признак
+
+```{r, warning=F, message=F}
+ggpairs(sleep.reg.outl |> filter(complete.cases(sleep.reg.outl)) |> mutate(PARADOX.REL=log(PARADOX.REL)) |> select(-NAME),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=12)),
+    ) 
+```
+
+График, кажется стал выглядеть лучше, поэтому оставим PARADOX.REL прологарифмированным.
+
+```{r}
+sleep.reg.outl |> arrange(desc(PARADOX.REL)) |> head(5) |> datatable(options = list(scrollX=T))
+```
+
+Окончательно прологарифмируем новый признак + из EXP_IND сделаем количественный признак.
+
+Также придётся убрать ехидну, т.к. для неё PARADOX.REL=0 (а log = -Inf)
+
+```{r}
+sleep.reg.outl <- sleep.reg.outl |> 
+  filter(NAME != "Echidna") |>
+  mutate(PARADOX.REL.log = log(PARADOX.REL), .after=PARADOX.REL) |>
+  mutate(EXP_IND = as.numeric(EXP_IND)) |>
+  select(-PARADOX.REL)
+```
+
+## Регрессия для полной модели
+
+Применяем регрессию. Сначала оставляем полную модель. Признак GESTTIME.log не включаем, т.к. предсказание по нему было бы не вполне корректным.
+
+```{r}
+model.full <- lm(LIFESPAN.log ~ . - NAME - GESTTIME.log, sleep.reg.outl, na.action=na.exclude)
+model.full.beta <- model.full |> lm.beta()
+model.full.beta |> summary()
+```
+
+Все (значимые) коэффициенты beta меньше 1, что значит, что признаки (по отдельности) хорошо коррелированны с откликом (нет явных признаков супрессоров, когда вместе коррелируют хорошо, а по отдельности --- плохо)
+
+```{r}
+confint(model.full.beta)
+confidenceEllipse(model.full.beta, 
+                  which.coef = c("BRAIN_WEIGHT.log", "PRED_IND3"),
+                  levels = c(0.95),
+                  col = c("steelblue"),
+                  xlim = c(0, 1.3),
+                  ylim = c(-2, 1))
+```
+
+Доверительный эллипсоид двух самых значимых признаков. Но очевидно, что BRAIN_WEIGHT гораздо более значим.
+
+```{r}
+model.tiny <- lm(LIFESPAN.log ~ BRAIN_WEIGHT.log, sleep.reg.outl, na.action=na.exclude)
+model.tiny.beta <- model.tiny |> lm.beta()
+model.tiny.beta |> summary()
+```
+
+В рамках эксперимента оставим только один признак. Полученная модель оказывается значимой и не сильно хуже полной. Есть подозрение, что в окончательной модели будет не на много больше признаков
+
+## Отбор признаков
+### Руками
+
+Для проверки будем использовать
+
+$$
+\text{GVIF} = \frac{\det\left( \left(\mathbf{X}^{(c)}_J\right)^T \mathbf{X}^{(c)}_J \right)}{\det\left( \left(\mathbf{X}^{(c)}_J\right)^T \mathbf{M}_{-J} \mathbf{X}^{(c)}_J \right)}
+$$
+
+GVIF --- аналог VIF для нескольких признаков (или одного, который распадается на несколько dummy-values). Возводится в степень 1/(2*d), где d --- число признаков J, регрессия которых строится на остальные (приведение к той же размерности что и VIF^(1/2), поэтому их можно сравнивать) 
+
+$$
+\eta^2_{\text{partial}} = \frac{\text{SSE}_{\text{red}} - \text{SSE}_{\text{full}}}{\text{SSE}_{\text{red}}}=1-\frac{1-R^2_{\text{full}}}{1-R^2_{\text{red}}}
+$$
+
+Обобщение (квадрата) коэффициента частной корреляции. $\text{SSE}_{\text{full}}$ --- SSE для полной модели, $\text{SSE}_{\text{red}}$ --- SSE для модели, из которой выкинули признак (или группу dummy признаков).
+Для одного признака --- это квадрат частной корреляции. Можно воспринимать как показатель изменения $R^2$ после удаления признака(ов). 
+
+Начнём с анализа полной модели (в vif(model) смотрим на последний столбец)
+
+```{r}
+AIC(model.full)
+vif(model.full)
+```
+
+Сперва уберём BODY_WEIGHT.log, т.к. он имеет большой VIF из-за корреляции с BRAIN_WEIGHT.log
+
+```{r}
+model.man.selected <- lm(LIFESPAN.log ~ . - NAME - GESTTIME.log - BODY_WEIGHT.log, sleep.reg.outl, na.action=na.exclude)
+model.man.selected.beta <- model.man.selected |> lm.beta()
+model.man.selected.beta |> summary()
+AIC(model.man.selected)
+VIF.cor.table <- cbind(vif(model.man.selected)[, c(1,3)],
+                       partial_eta_sq(model.man.selected)) 
+colnames(VIF.cor.table) <- c("GVIF", "GVIF^(1/(2*Df))", "partial cor")
+VIF.cor.table
+```
+
+Уберём EXP_IND (большой VIF)
+
+```{r}
+model.man.selected <- lm(LIFESPAN.log ~ . - NAME - GESTTIME.log - BODY_WEIGHT.log - EXP_IND, sleep.reg.outl, na.action=na.exclude)
+model.man.selected.beta <- model.man.selected |> lm.beta()
+model.man.selected.beta |> summary()
+AIC(model.man.selected)
+VIF.cor.table <- cbind(vif(model.man.selected)[, c(1,3)],
+                       partial_eta_sq(model.man.selected)) 
+colnames(VIF.cor.table) <- c("GVIF", "GVIF^(1/(2*Df))", "partial cor")
+VIF.cor.table
+```
+
+Уберём DANG_IND (достаточно большой VIF, маленькая корреляция)
+
+```{r}
+model.man.selected <- lm(LIFESPAN.log ~ . - NAME - GESTTIME.log - BODY_WEIGHT.log - EXP_IND - DANG_IND, sleep.reg.outl, na.action=na.exclude)
+model.man.selected.beta <- model.man.selected |> lm.beta()
+model.man.selected.beta |> summary()
+AIC(model.man.selected)
+VIF.cor.table <- cbind(vif(model.man.selected)[, c(1,3)],
+                       partial_eta_sq(model.man.selected)) 
+colnames(VIF.cor.table) <- c("GVIF", "GVIF^(1/(2*Df))", "partial cor")
+VIF.cor.table
+```
+
+Уберём PARADOX.REL.log (пользы не приносит). Можем увеличить объём выборки (без этого признака, пропусков меньше)
+
+```{r}
+model.man.selected <- lm(LIFESPAN.log ~ BRAIN_WEIGHT.log + SLEEP + PRED_IND, sleep.reg.outl, na.action=na.exclude)
+model.man.selected.beta <- model.man.selected |> lm.beta()
+model.man.selected.beta |> summary()
+AIC(model.man.selected)
+VIF.cor.table <- cbind(vif(model.man.selected)[, c(1,3)],
+                       partial_eta_sq(model.man.selected)) 
+colnames(VIF.cor.table) <- c("GVIF", "GVIF^(1/(2*Df))", "partial cor")
+VIF.cor.table
+```
+
+Уберём SLEEP (пользы не приносит). Опять увеличим объём выборки.
+
+```{r}
+model.man.selected <- lm(LIFESPAN.log ~ BRAIN_WEIGHT.log + PRED_IND, sleep.reg.outl, na.action=na.exclude)
+model.man.selected.beta <- model.man.selected |> lm.beta()
+model.man.selected.beta |> summary()
+AIC(model.man.selected)
+VIF.cor.table <- cbind(vif(model.man.selected)[, c(1,3)],
+                       partial_eta_sq(model.man.selected)) 
+colnames(VIF.cor.table) <- c("GVIF", "GVIF^(1/(2*Df))", "partial cor")
+VIF.cor.table
+```
+
+Оставим от PRED_IND только значение 3, посмотрим, что получится
+
+```{r}
+model.man.selected <- lm(LIFESPAN.log ~ BRAIN_WEIGHT.log + PRED_IND, sleep.reg.outl |> mutate(PRED_IND = as.numeric(PRED_IND == 3)), na.action=na.exclude)
+model.man.selected.beta <- model.man.selected |> lm.beta()
+model.man.selected.beta |> summary()
+AIC(model.man.selected)
+VIF.cor.table <- cbind(vif(model.man.selected),
+                       partial_eta_sq(model.man.selected)) 
+colnames(VIF.cor.table) <- c("VIF", "partial cor")
+VIF.cor.table
+```
+Модель улучшилась по AIC, VIF (уже обычному) и adj.R^2.
+
+И попробуем просто убрать
+
+```{r}
+model.man.selected <- lm(LIFESPAN.log ~ BRAIN_WEIGHT.log, sleep.reg.outl, na.action=na.exclude)
+model.man.selected.beta <- model.man.selected |> lm.beta()
+model.man.selected.beta |> summary()
+AIC(model.man.selected)
+```
+
+Результат стал хуже. Поэтому остановимся н сокращении признака PRED_IND до двух значений.
+
+Порядок удаления признаков:
+
+BODY.WEIGHT, EXP_IND, DANG_IND, PARADOX.REL, SLEEP
+
+### Автоматический
+
+Backward:
+
+```{r}
+model.full <- lm(LIFESPAN.log ~ . - NAME - GESTTIME.log, sleep.reg.outl |> na.omit())
+step <- stepAIC(model.full, scope=list(upper = ~ . - NAME - GESTTIME.log, lower = ~1), trace=T, direction="backward")
+```
+
+Результат аналогичный ручному, с точностью до порядка удаления признаков.
+
+Попробуем forward
+
+```{r}
+model.empty <- lm(LIFESPAN.log ~ 1, sleep.reg.outl |> na.omit(), na.action=na.exclude)
+step <- stepAIC(model.empty, scope=list(upper = ~ BODY_WEIGHT.log+BRAIN_WEIGHT.log+PARADOX.REL.log+SLEEP+PRED_IND+DANG_IND+EXP_IND, lower = ~1), trace=T, direction="forward")
+```
+
+Результат тот же самый.
+
+## Поиск выбросов
+
+Модель с отобранными и преобразованными признаками:
+
+```{r}
+model <- lm(LIFESPAN.log ~ BRAIN_WEIGHT.log + PRED_IND, sleep.reg.outl |> mutate(PRED_IND = as.numeric(PRED_IND == 3)), na.action = na.exclude)
+model |> lm.beta() |> summary()
+```
+
+Проверка нормальности остатков
+
+```{r}
+qqnorm(model$residuals)
+qqline(model$residuals, col="red")
+```
+
+```{r}
+lillie.test(model$residuals)
+ad.test(model$residuals)
+shapiro.test(model$residuals)
+```
+
+Не один из критериев не отверг гипотезу о нормальности. Это утешает, т.к. размер выборки не большой (хотя уверенно ничего сказать нельзя)
+
+Predicted vs Residuals
+
+```{r}
+plot(model$fitted.values, rstandard(model), xlab="Predicted", ylab="Residuals (stud.)")
+abline(h=0, lty=2)
+```
+
+Явной гетероскедастичности не наблюдается.
+
+```{r}
+plot(rstandard(model), rstudent(model), xlab="Residuals (stud.)", ylab="Deleted resid.")
+abline(lm(rstudent(model) ~ rstandard(model)), col="red")
+i <- rstudent(model) |> which.max()
+sleep.reg.outl[i,]
+```
+
+Из линейной зависимости явно выбивается индивид с наибольшим стьюдентизированным остатком --- Генета (#15). 
+
+```{r}
+plot(model)
+```
+
+На графике Fitted vs |Resid| явной гетероскедостичности тоже не замечено (только малый размер выборки)
+
+```{r}
+length(model$coefficients) / length(model$residuals)
+```
+(средний рычаг)
+
+```{r}
+cooksd <- cooks.distance(model) |> sort(decreasing=T)
+barplot(cooksd, 
+        main = "Расстояние Кука",
+        ylab = "Cook's distance", 
+        border = NA)
+barplot(cooksd[1:8], 
+        main = "Расстояние Кука",
+        ylab = "Cook's distance", 
+        border = NA)
+```
+
+По расстоянию Кука нет особо выбивающихся индивидов. Даже генета, как ни странно, имеет не самое большое значение
+
+```{r}
+mahalanobisd <- mahalanobis(model$model[,which(colnames(model$model) != "LIFESPAN.log")], 
+            center=colMeans(model$model[,which(colnames(model$model) != "LIFESPAN.log")]), 
+            cov=cov(model$model[,which(colnames(model$model) != "LIFESPAN.log")])) |> sort(decreasing=T)
+n <- length(model$residuals)
+k <- length(model$coefficients) - 1
+threshold_mahal <- qbeta(0.95, k/2, (n-k-1)/2) * (n-1)^2 / n
+threshold_mahal
+qchisq(0.95, k)
+barplot(mahalanobisd, 
+        main = "Расстояние Махаланобиса",
+        ylab = "Mahalanobis' distance", 
+        border = NA,
+        col = ifelse(mahalanobisd > threshold_mahal, "blue", "steelblue"))
+barplot(mahalanobisd[1:5], 
+        main = "Расстояние Махаланобиса",
+        ylab = "Mahalanobis' distance", 
+        border = NA)
+```
+
+```{r}
+1 - pbeta(mahalanobisd[1:2] * n / (n-1)^2, k/2, (n-k-1)/2)
+```
+
+```{r}
+sleep.reg.outl[c(1,4),] |> select(NAME, LIFESPAN.log, BRAIN_WEIGHT.log, PRED_IND)
+model$fitted.values[c(1,4)]
+```
+
+Наиболее резкий скачок по расстоянию Махаланобиса наблюдается у слонов. Это было заметно и по графикам. В то же время, отклонения не выглядят зашкаливающими, чтобы удалять слонов из выборки.
+
+Удалим только генету.
+
+```{r}
+sleep.reg.final <- sleep.reg.outl |> filter(!(NAME %in% c("Genet"))) |> mutate(PRED_IND3 = as.numeric(PRED_IND == 3))
+model.final <- lm(LIFESPAN.log ~ BRAIN_WEIGHT.log + PRED_IND3, sleep.reg.final, na.action = na.exclude)
+model.final |> lm.beta() |> summary()
+```
+
+## Проверка
+
+При помощи полученной модели попробуем предсказать продолжительность жизни тех четырёх зверьков.
+
+```{r}
+sleep.log.test <- sleep.log |> filter(!complete.cases(LIFESPAN.log)) |> mutate(PRED_IND3 = as.numeric(PRED_IND == 3))
+```
+
+```{r}
+predictions <- data.frame(NAME=sleep.log.test|>pull(NAME), BRAIN_WEIGHT=exp(sleep.log.test|>pull(BRAIN_WEIGHT.log)), PRED_IND3=sleep.log.test|>pull(PRED_IND3), LIFESPAN.predicted = exp(predict(model.final, sleep.log.test)))
+predictions
+
+confint.fit <- predict(model.final, newdata=sleep.log.test, interval = "confidence", level=0.95) |> exp()
+rownames(confint.fit) <- sleep.log.test |> pull(NAME)
+confint.fit
+
+predint.fit <- predict(model.final, newdata=sleep.log.test, interval = "prediction", level=0.95) |> exp()
+rownames(predint.fit) <- sleep.log.test |> pull(NAME)
+predint.fit
+```
+
+Доверительный интервал (для среднего) не очень осмыслен, т.к. это интервал для средней максимальной продолжительности жизни разных видов, но при этом имеющих одинаковые характеристики. Хотя с другой стороны наша модель использует, по факту, только массу мозга, поэтому, может быть, в некоторых случаях это и может иметь смысл. Например: изучаем несколько видов животных, примерно одинакового размера (а значит, скорее всего, примерно одинаковой массы мозга).
+
+Предсказательный интервал мы используем, чтобы проверить, попадут ли "реальные" значения (взятые с Википедии) в этот интервал (который оказался достаточно широким).
+
+Arc. ground squirrel --- "редко живут более 3 лет. Число 3-летних зверьков в популяции составляет не более 10—11 %." (не попали)
+
+Desert hedgehog --- "В природе эфиопский ёж доживает до 10 лет." (попали)
+
+Mole rat --- очень сильно зависит от вида, но, судя по данным, речь идёт о Naked Mole Rat, который живёт более 30 лет. (самый долгоживущий грызун, не попали)
+
+Mountain beaver --- от 5 до 10 лет (т.е. 10 лет, попали)
+
+```{r}
+sleep.log.wiki <- sleep.log.outl |>
+    mutate(PRED_IND3=as.numeric(PRED_IND==3)) |> 
+    select(NAME, BRAIN_WEIGHT.log, PRED_IND3, LIFESPAN.log)
+
+na_idx <- which(is.na(sleep.log.wiki$LIFESPAN.log))
+sleep.log.wiki$LIFESPAN.log[na_idx] <- log(c(3,10,30,10))
+
+labels <- rep(0, nrow(sleep.log.wiki))
+labels[na_idx] <- 1
+sleep.log.wiki <- sleep.log.wiki |> mutate(predicted = labels)
+```
+
+```{r}
+ggpairs(sleep.log.wiki |> select(-NAME, -predicted),
+       lower = list(continuous = "points", combo  = "points"), 
+       upper = list(continuous = wrap("points")),       
+       diag = list(continuous = wrap("barDiag", bins=12)),
+       mapping=ggplot2::aes(colour=sleep.log.wiki|>pull(predicted)|>as.factor())
+    ) + scale_color_manual(values = c("black", "red"))
+```
+
+Подставим в данные значения их Википедии, чтобы проверить не являются ли эти 4 индивида выбросами (судя по графикам).
+
+Очевидно выбивается голый землекоп. Судя по статье в Википедии, он действительно уникален по многим параметрам (в т.ч. по массе мозга). Суслик, с другой стороны, не выбивается так сильно.
